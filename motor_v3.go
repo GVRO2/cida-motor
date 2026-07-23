@@ -215,6 +215,7 @@ func main() {
 	isWatcher := false
 	profile := "auto"
 	dictScope := "file"
+	mode := "lossless"
 	failOnInflation := false
 	reportFormat := "both"
 	reportPath := ""
@@ -235,6 +236,11 @@ func main() {
 			verifySemantics = true
 		} else if arg == "--dry-run" {
 			dryRun = true
+		} else if strings.HasPrefix(arg, "--mode=") {
+			mode = strings.TrimPrefix(arg, "--mode=")
+		} else if arg == "--mode" && i+1 < len(args) {
+			mode = args[i+1]
+			i++
 		} else if strings.HasPrefix(arg, "--profile=") {
 			profile = strings.TrimPrefix(arg, "--profile=")
 		} else if arg == "--profile" && i+1 < len(args) {
@@ -263,6 +269,12 @@ func main() {
 		}
 	}
 
+	validModes := map[string]bool{"lossless": true, "semantic": true}
+	if !validModes[mode] {
+		fmt.Printf("❌ Erro: Modo inválido: %s\n", mode)
+		os.Exit(1)
+	}
+
 	validProfiles := map[string]bool{"auto": true, "code": true, "java": true, "markdown": true, "bmad": true}
 	if !validProfiles[profile] {
 		fmt.Printf("❌ Erro: Perfil inválido: %s\n", profile)
@@ -274,6 +286,18 @@ func main() {
 		fmt.Printf("❌ Erro: Escopo do dicionário inválido: %s\n", dictScope)
 		os.Exit(1)
 	}
+
+	if mode == "lossless" {
+		if profile == "code" || profile == "java" {
+			fmt.Println("❌ Lossless mode currently supports only Markdown and BMAD profiles. Use --mode semantic for code or Java inputs.")
+			os.Exit(1)
+		}
+		if dictScope == "corpus" {
+			fmt.Println("❌ Corpus dictionary is not currently supported in lossless mode. Use --dictionary-scope file or --mode semantic.")
+			os.Exit(1)
+		}
+	}
+
 
 	validReports := map[string]bool{"text": true, "json": true, "both": true}
 	if !validReports[reportFormat] {
@@ -334,12 +358,12 @@ func main() {
 
 			if changed {
 				fmt.Println("🔄 Alteração detectada, recompilando...")
-				processarEComparar(pastaOrig, pastaComp, profile, dictScope, failOnInflation, reportFormat, reportPath, verifySemantics, dryRun)
+				processarEComparar(pastaOrig, pastaComp, mode, profile, dictScope, failOnInflation, reportFormat, reportPath, verifySemantics, dryRun)
 			}
 			time.Sleep(2 * time.Second)
 		}
 	} else {
-		processarEComparar(pastaOrig, pastaComp, profile, dictScope, failOnInflation, reportFormat, reportPath, verifySemantics, dryRun)
+		processarEComparar(pastaOrig, pastaComp, mode, profile, dictScope, failOnInflation, reportFormat, reportPath, verifySemantics, dryRun)
 	}
 }
 
@@ -354,9 +378,19 @@ type JavaRawMetric struct {
 	TokensAuxiliares int    `json:"tokens_auxiliares"`
 }
 
-func processarEComparar(pastaOrig string, pastaComp string, profile string, dictScope string, failOnInflation bool, reportFormat string, reportPath string, verifySemantics bool, dryRun bool) {
+func processarEComparar(pastaOrig string, pastaComp string, mode string, profile string, dictScope string, failOnInflation bool, reportFormat string, reportPath string, verifySemantics bool, dryRun bool) {
 	absOrig, _ := filepath.Abs(pastaOrig)
 	absComp, _ := filepath.Abs(pastaComp)
+
+	if absOrig == absComp {
+		fmt.Printf("❌ Erro: Destino não pode ser igual à origem: %s\n", absOrig)
+		os.Exit(4)
+	}
+	rel, err := filepath.Rel(absOrig, absComp)
+	if err == nil && !strings.HasPrefix(rel, "..") && rel != "." {
+		fmt.Printf("❌ Erro: Destino não pode ser dentro da origem: %s\n", absComp)
+		os.Exit(4)
+	}
 
 	dirIsEmpty := true
 	if entries, err := os.ReadDir(absComp); err == nil && len(entries) > 0 {
@@ -584,6 +618,7 @@ func processarEComparar(pastaOrig string, pastaComp string, profile string, dict
 			getToolPath("token_optimizer.py"),
 			"--src", absOrig,
 			"--dst", absComp,
+			"--mode", mode,
 			"--profile", profile,
 			"--dictionary-scope", dictScope,
 			"--report", reportFormat,

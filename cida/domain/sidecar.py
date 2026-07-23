@@ -1,5 +1,50 @@
 import re
+from typing import Any
 from cida.domain.errors import SidecarValidationError
+
+ENVELOPE_START = "<!-- CIDA_COMPRESSED_FORMAT"
+ENVELOPE_END = "-->"
+
+def create_compressed_envelope(payload: str, sidecar_ref: str, source_sha256: str, mode: str = "lossless", strategy: str = "dictionary") -> str:
+    header = (
+        f"<!-- CIDA_COMPRESSED_FORMAT\n"
+        f"version: 1\n"
+        f"mode: {mode}\n"
+        f"sidecar_required: true\n"
+        f"sidecar_ref: {sidecar_ref}\n"
+        f"source_sha256: {source_sha256}\n"
+        f"compression_strategy: {strategy}\n"
+        f"-->\n"
+    )
+    return header + payload
+
+def parse_compressed_envelope(content: str) -> tuple:
+    if not content.startswith(ENVELOPE_START):
+        return None, content
+
+    end_idx = content.find(ENVELOPE_END)
+    if end_idx == -1:
+        return None, content
+
+    header_block = content[len(ENVELOPE_START):end_idx].strip()
+    payload = content[end_idx + len(ENVELOPE_END):].lstrip('\r\n')
+
+    metadata: dict[str, Any] = {}
+    for line in header_block.splitlines():
+        if ':' in line:
+            k, v = line.split(':', 1)
+            metadata[k.strip()] = v.strip()
+
+    if "version" in metadata:
+        try:
+            metadata["version"] = int(metadata["version"])
+        except ValueError:
+            pass
+    if "sidecar_required" in metadata:
+        metadata["sidecar_required"] = metadata["sidecar_required"].lower() in ("true", "1", "yes")
+
+    return metadata, payload
+
 
 def create_sidecar_data(source_name: str, original_content: bytes, entries: dict, hash_service) -> dict:
     if not isinstance(entries, dict):

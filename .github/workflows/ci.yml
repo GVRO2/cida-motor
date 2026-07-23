@@ -161,4 +161,4 @@ jobs:
         
         echo "Comparing PR manifest with base branch manifest..."
         cd $GITHUB_WORKSPACE
-        python scripts/compare_manifests.py /tmp/manifest-base.json manifest-ubuntu-latest/manifest-ubuntu-latest.json || true
+        python scripts/compare_manifests.py /tmp/manifest-base.json manifest-ubuntu-latest/manifest-ubuntu-latest.json

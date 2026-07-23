@@ -8,9 +8,12 @@ from typing import Optional
 class OfflineTokenizer:
     """Concrete offline tiktoken token counter adapter."""
 
-    def __init__(self, cache_dir: Optional[str] = None):
+    def __init__(self, cache_dir: Optional[str] = None, enable_cache: bool = True):
         self.cache_dir = cache_dir
+        self.enable_cache = enable_cache
         self._enc = None
+        self._token_cache: dict = {}
+        self._cache_max_size = 10000
 
     def _resolve_cache_dir(self) -> Optional[str]:
         return self.cache_dir or os.environ.get("TIKTOKEN_CACHE_DIR")
@@ -50,9 +53,21 @@ class OfflineTokenizer:
     def count(self, text: str) -> int:
         if not text:
             return 0
+
+        if self.enable_cache:
+            content_hash = hashlib.sha256(text.encode('utf-8')).digest()
+            if content_hash in self._token_cache:
+                return self._token_cache[content_hash]
+
         try:
-            return len(self.get_encoder().encode(text))
+            cnt = len(self.get_encoder().encode(text))
+            if self.enable_cache:
+                if len(self._token_cache) >= self._cache_max_size:
+                    self._token_cache.clear()
+                self._token_cache[content_hash] = cnt
+            return cnt
         except TokenizerError:
             raise
         except Exception as e:
             raise TokenizerError(f"Tokenizer error: {e}") from e
+

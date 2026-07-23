@@ -35,15 +35,15 @@ def test_counter_main_generic_error():
 
 def test_translate_main_no_args():
     with patch.object(sys, "argv", ["translate.py"]), \
-         patch("builtins.print") as mock_print:
+         pytest.raises(SystemExit) as exc:
         translate_main()
-        mock_print.assert_called_with("Uso: python3 translate.py [ID1] [ID2] ... [--path <caminho_da_pasta_de_sidecars>]")
+    assert exc.value.code == 1
 
 def test_translate_main_missing_sidecar_dir():
     with patch.object(sys, "argv", ["translate.py", "AA", "--path", "/non/existent/sidecar/dir/cida"]), \
-         patch("sys.exit") as mock_exit:
+         pytest.raises(SystemExit) as exc:
         translate_main()
-        mock_exit.assert_called_with(5)
+    assert exc.value.code == 5
 
 def test_translate_main_with_valid_sidecar(tmp_path):
     sidecar_dir = tmp_path / "sidecar"
@@ -63,9 +63,9 @@ def test_translate_main_corrupted_sidecar(tmp_path):
     sidecar_file.write_text('corrupted json')
 
     with patch.object(sys, "argv", ["translate.py", "AA", "--path", str(sidecar_dir)]), \
-         patch("sys.exit") as mock_exit:
+         pytest.raises(SystemExit) as exc:
         translate_main()
-        mock_exit.assert_called_with(5)
+    assert exc.value.code == 5
 
 def test_cli_main_src_not_found(tmp_path):
     dst = tmp_path / "dst"
@@ -109,6 +109,7 @@ def test_cli_main_corpus_scope(tmp_path):
 
     test_args = [
         "cida", "--src", str(src), "--dst", str(dst),
+        "--mode", "semantic",
         "--dictionary-scope", "corpus", "--report-path", str(tmp_path / "rep")
     ]
     with patch.object(sys, "argv", test_args):
@@ -121,6 +122,7 @@ def test_cli_main_code_profile(tmp_path):
 
     test_args = [
         "cida", "--src", str(src), "--dst", str(dst),
+        "--mode", "semantic",
         "--profile", "code", "--dictionary-scope", "none"
     ]
     with patch.object(sys, "argv", test_args):

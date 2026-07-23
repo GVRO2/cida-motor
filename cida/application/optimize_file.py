@@ -104,17 +104,30 @@ class FileOptimizerUsecase:
                     working_dict.pop(word)
                     continue
 
-            tokens_min = self.token_counter.count(candidate_minified)
-            tokens_sidecar = self.token_counter.count(self.json_codec.encode(sidecar_data, indent=4))
-            tokens_instr = self.token_counter.count("Use the companion sidecar file to resolve aliases.")
+            sidecar_ref = self.file_repo.basename(filepath) + ".cidatkn"
+            envelope_header = (
+                f"<!-- CIDA_COMPRESSED_FORMAT\n"
+                f"version: 1\n"
+                f"mode: lossless\n"
+                f"sidecar_required: true\n"
+                f"sidecar_ref: {sidecar_ref}\n"
+                f"source_sha256: {sidecar_data['source_sha256']}\n"
+                f"compression_strategy: dictionary\n"
+                f"-->\n"
+            )
 
-            effective_tokens = tokens_min + tokens_sidecar + tokens_instr
+            tokens_min = self.token_counter.count(candidate_minified)
+            tokens_envelope = self.token_counter.count(envelope_header)
+            tokens_sidecar = self.token_counter.count(self.json_codec.encode(sidecar_data, indent=4))
+
+            effective_tokens = tokens_min + tokens_envelope + tokens_sidecar
 
             if effective_tokens < best_tokens:
                 best_tokens = effective_tokens
                 best_minified = candidate_minified
                 best_sidecar_data = sidecar_data
 
-        final_tokens_dict = self.token_counter.count(self.json_codec.encode(best_sidecar_data, indent=4)) if best_sidecar_data else 0
-        return best_minified, best_sidecar_data, final_tokens_dict
+        final_sidecar_tokens = self.token_counter.count(self.json_codec.encode(best_sidecar_data, indent=4)) if best_sidecar_data else 0
+        return best_minified, best_sidecar_data, final_sidecar_tokens
+
 

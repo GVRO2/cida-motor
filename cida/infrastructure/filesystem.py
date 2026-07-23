@@ -17,16 +17,38 @@ class PhysicalFilesystem:
         with open(filepath, 'rb') as f:
             return f.read()
 
-    def write_text(self, filepath: str, content: str, encoding: str = "utf-8") -> None:
-        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+    def write_text(self, filepath: str, content: str, encoding: str = "utf-8", durable: bool = False) -> None:
+        abs_path = os.path.abspath(filepath)
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
         content_lf = content.replace('\r\n', '\n')
-        with open(filepath, 'w', encoding=encoding, newline='\n') as f:
-            f.write(content_lf)
+        tmp_path = f"{abs_path}.tmp.{os.getpid()}"
+        try:
+            with open(tmp_path, 'w', encoding=encoding, newline='\n') as f:
+                f.write(content_lf)
+                f.flush()
+                if durable:
+                    os.fsync(f.fileno())
+            os.replace(tmp_path, abs_path)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
 
-    def write_bytes(self, filepath: str, content: bytes) -> None:
-        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
-        with open(filepath, 'wb') as f:
-            f.write(content)
+    def write_bytes(self, filepath: str, content: bytes, durable: bool = False) -> None:
+        abs_path = os.path.abspath(filepath)
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        tmp_path = f"{abs_path}.tmp.{os.getpid()}"
+        try:
+            with open(tmp_path, 'wb') as f:
+                f.write(content)
+                f.flush()
+                if durable:
+                    os.fsync(f.fileno())
+            os.replace(tmp_path, abs_path)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
 
     def exists(self, path: str) -> bool:
         return os.path.exists(path)
@@ -87,3 +109,25 @@ class PhysicalFilesystem:
         if not os.path.exists(path):
             return []
         return os.listdir(path)
+
+
+def validate_filesystem_safety(source: str, destination: str) -> None:
+    from cida.domain.errors import SourcePathError
+
+    src_abs = os.path.abspath(source)
+    dst_abs = os.path.abspath(destination)
+
+    if src_abs == dst_abs:
+        raise SourcePathError(f"Destination path cannot be identical to source path: {src_abs}")
+
+    try:
+        common = os.path.commonpath([src_abs, dst_abs])
+    except ValueError:
+        return
+
+    if common == src_abs:
+        raise SourcePathError(f"Destination directory cannot be nested inside source directory: {dst_abs} inside {src_abs}")
+
+    if common == dst_abs and os.path.isdir(dst_abs):
+        raise SourcePathError(f"Source directory cannot be inside destination directory: {src_abs} inside {dst_abs}")
+

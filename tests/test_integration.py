@@ -256,6 +256,7 @@ class TestPythonUsecases(unittest.TestCase):
             "token_optimizer.py",
             "--src", self.src_dir,
             "--dst", self.dst_dir,
+            "--mode", "semantic",
             "--profile", "auto",
             "--dictionary-scope", "corpus",
             "--report", "both",

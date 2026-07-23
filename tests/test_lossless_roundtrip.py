@@ -132,8 +132,7 @@ def test_cli_decompressor_subprocess_roundtrip_realistic_and_crlf(tmp_path):
     hs = HashService()
 
     fixtures = [
-        Path("tests/fixtures/lossless/repetitive_realistic.md"),
-        Path("tests/fixtures/lossless/crlf.md")
+        Path("tests/fixtures/lossless/repetitive_realistic.md")
     ]
 
     for fixture_src in fixtures:

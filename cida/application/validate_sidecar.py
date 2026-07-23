@@ -1,9 +1,11 @@
+import os
+from typing import Optional
 from cida.application.ports import FileRepository, JsonCodec, HashService
-from cida.domain.sidecar import validate_sidecar, validate_sidecar_schema
+from cida.domain.sidecar import validate_sidecar, validate_sidecar_schema, parse_compressed_envelope
 from cida.domain.errors import SidecarValidationError
 
 class SidecarValidatorUsecase:
-    """Usecase to audit generated sidecar files."""
+    """Usecase to audit generated sidecar files and bundle integrity."""
 
     def __init__(self, file_repo: FileRepository, json_codec: JsonCodec, hash_service: HashService):
         self.file_repo = file_repo
@@ -19,11 +21,56 @@ class SidecarValidatorUsecase:
                     validate_sidecar_schema(data)
 
                     if data.get("source") != "corpus":
-                        orig_file_path = self.file_repo.join(src_abs, data["source"])
-                        if self.file_repo.exists(orig_file_path):
-                            orig_bytes = self.file_repo.read_bytes(orig_file_path)
-                            validate_sidecar(data, data["source"], orig_bytes, self.hash_service)
+                        src_dir = self.file_repo.dirname(src_abs) if self.file_repo.is_file(src_abs) else src_abs
+                        orig_file_path = self.file_repo.join(src_dir, data["source"])
+                        if not self.file_repo.exists(orig_file_path):
+                            raise SidecarValidationError(
+                                f"Orphan sidecar detected: source file '{data['source']}' does not exist in '{src_abs}'"
+                            )
+                        orig_bytes = self.file_repo.read_bytes(orig_file_path)
+                        validate_sidecar(data, data["source"], orig_bytes, self.hash_service)
                 except Exception as e:
                     if isinstance(e, SidecarValidationError):
                         raise
                     raise SidecarValidationError(f"Sidecar validation failed for {self.file_repo.basename(f_path)}: {e}") from e
+
+    def validate_output_bundle(self, source_root: str, output_root: str, output_file: str,
+                               sidecar_file: Optional[str] = None, manifest: Optional[dict] = None) -> None:
+        src_root_abs = self.file_repo.abspath(source_root)
+        out_root_abs = self.file_repo.abspath(output_root)
+        out_file_abs = self.file_repo.abspath(output_file)
+
+        if not self.file_repo.exists(out_file_abs):
+            raise SidecarValidationError(f"Output file does not exist: {out_file_abs}")
+
+        try:
+            if os.path.commonpath([out_root_abs, out_file_abs]) != out_root_abs:
+                raise SidecarValidationError(f"Output file is outside output root: {out_file_abs}")
+        except ValueError:
+            raise SidecarValidationError(f"Output file is outside output root: {out_file_abs}")
+
+        content_bytes = self.file_repo.read_bytes(out_file_abs)
+        content_text = content_bytes.decode('utf-8', errors='replace')
+
+        envelope_meta, payload = parse_compressed_envelope(content_text)
+
+        if envelope_meta and envelope_meta.get("sidecar_required"):
+            if not sidecar_file:
+                ref = envelope_meta.get("sidecar_ref", self.file_repo.basename(out_file_abs) + ".cidatkn")
+                sidecar_file = self.file_repo.join(self.file_repo.dirname(out_file_abs), ref)
+
+            if not self.file_repo.exists(sidecar_file):
+                raise SidecarValidationError(f"Required sidecar file does not exist: {sidecar_file}")
+
+            sidecar_raw = self.file_repo.read_text(sidecar_file)
+            sidecar_data = self.json_codec.decode(sidecar_raw)
+            validate_sidecar_schema(sidecar_data)
+
+            source_rel = sidecar_data.get("source")
+            if isinstance(source_rel, str) and source_rel != "corpus":
+                src_path = self.file_repo.join(src_root_abs, source_rel)
+                if not self.file_repo.exists(src_path):
+                    raise SidecarValidationError(f"Source file specified in sidecar does not exist: {src_path}")
+                orig_bytes = self.file_repo.read_bytes(src_path)
+                validate_sidecar(sidecar_data, source_rel, orig_bytes, self.hash_service)
+

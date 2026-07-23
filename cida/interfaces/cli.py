@@ -6,7 +6,8 @@ import re
 from cida.domain.errors import (
     CidaError, SourcePathError
 )
-from cida.infrastructure.filesystem import PhysicalFilesystem
+from cida.domain.policies import validate_mode_profile_combination
+from cida.infrastructure.filesystem import PhysicalFilesystem, validate_filesystem_safety
 from cida.infrastructure.tokenizer import OfflineTokenizer
 from cida.infrastructure.hashing import HashService
 from cida.infrastructure.json_codec import JsonCodec
@@ -14,6 +15,7 @@ from cida.application.optimize_file import FileOptimizerUsecase
 from cida.application.optimize_corpus import CorpusOptimizerUsecase
 from cida.application.validate_sidecar import SidecarValidatorUsecase
 from cida.application.generate_report import ReportGeneratorUsecase
+from cida.domain.sidecar import create_compressed_envelope
 from cida.markdown.protected_regions import ProtectedRegionsManager
 from cida.markdown.dictionary import apply_dictionary, CorpusDictionaryBuilder
 from cida.markdown.transforms import (
@@ -21,6 +23,11 @@ from cida.markdown.transforms import (
     table_whitespace, list_compaction, minificar_codigo_para_ia
 )
 from cida.markdown.semantic_equivalence import validate_semantics
+
+class CidaArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        sys.stderr.write(f"error: {message}\n")
+        sys.exit(1)
 
 def counter_main():
     try:
@@ -40,38 +47,83 @@ def translate_main():
         json_codec = JsonCodec()
 
         if len(sys.argv) < 2:
-            print("Uso: python3 translate.py [ID1] [ID2] ... [--path <caminho_da_pasta_de_sidecars>]")
-            return
-
-        sidecar_dir = os.path.join(os.getcwd(), "sidecar")
-        if not file_repo.exists(sidecar_dir) and file_repo.exists(os.path.join(os.getcwd(), "tknd")):
-            sidecar_dir = os.path.join(os.getcwd(), "tknd")
+            print("Usage: translate.py [--sidecar <file.cidatkn>] [--source <source_file>] [--path <dir>] <alias1> [alias2 ...]", file=sys.stderr)
+            sys.exit(1)
 
         args = sys.argv[1:]
+        sidecar_file = None
+        source_file = None
+        sidecar_dir = None
+
+        if "--sidecar" in args:
+            idx = args.index("--sidecar")
+            if idx + 1 < len(args):
+                sidecar_file = args[idx+1]
+                args = args[:idx] + args[idx+2:]
+        if "--source" in args:
+            idx = args.index("--source")
+            if idx + 1 < len(args):
+                source_file = args[idx+1]
+                args = args[:idx] + args[idx+2:]
         if "--path" in args:
             idx = args.index("--path")
             if idx + 1 < len(args):
                 sidecar_dir = args[idx+1]
                 args = args[:idx] + args[idx+2:]
 
-        mapping = {}
-        if not file_repo.exists(sidecar_dir):
-            print(f"Erro: Pasta {sidecar_dir} não encontrada.", file=sys.stderr)
-            sys.exit(5)
+        tokens_to_translate = [a for a in args if not a.startswith("-")]
 
-        for file in file_repo.list_dir(sidecar_dir):
-            if file.endswith(".cidatkn"):
-                try:
-                    data = json_codec.decode(file_repo.read_text(os.path.join(sidecar_dir, file)))
-                    if isinstance(data, dict) and "entries" in data:
-                        for alias, val in data["entries"].items():
-                            mapping[alias] = val
-                except Exception as e:
-                    print(f"Erro ao ler dicionário {file}: {e}", file=sys.stderr)
-                    sys.exit(5)
+        if not tokens_to_translate:
+            print("Usage: translate.py [--sidecar <file.cidatkn>] [--source <source_file>] [--path <dir>] <alias1> [alias2 ...]", file=sys.stderr)
+            sys.exit(1)
+
+        mapping = {}
+
+        if sidecar_file:
+            if not file_repo.exists(sidecar_file):
+                print(f"Error: Sidecar file '{sidecar_file}' not found.", file=sys.stderr)
+                sys.exit(5)
+            data = json_codec.decode(file_repo.read_text(sidecar_file))
+            if isinstance(data, dict) and "entries" in data:
+                mapping = data["entries"]
+        elif source_file:
+            cand1 = source_file + ".cidatkn"
+            cand2 = os.path.join(os.path.dirname(source_file), os.path.basename(source_file) + ".cidatkn")
+            sc_path = cand1 if file_repo.exists(cand1) else cand2
+            if not file_repo.exists(sc_path):
+                print(f"Error: Sidecar for source file '{source_file}' not found at '{sc_path}'.", file=sys.stderr)
+                sys.exit(5)
+            data = json_codec.decode(file_repo.read_text(sc_path))
+            if isinstance(data, dict) and "entries" in data:
+                mapping = data["entries"]
+        else:
+            if not sidecar_dir:
+                sidecar_dir = os.path.join(os.getcwd(), "sidecar")
+                if not file_repo.exists(sidecar_dir) and file_repo.exists(os.path.join(os.getcwd(), "tknd")):
+                    sidecar_dir = os.path.join(os.getcwd(), "tknd")
+
+            if not file_repo.exists(sidecar_dir):
+                print(f"Error: Sidecar directory '{sidecar_dir}' not found.", file=sys.stderr)
+                sys.exit(5)
+
+            for file in sorted(file_repo.list_dir(sidecar_dir)):
+                if file.endswith(".cidatkn"):
+                    try:
+                        data = json_codec.decode(file_repo.read_text(os.path.join(sidecar_dir, file)))
+                        if isinstance(data, dict) and "entries" in data:
+                            for alias, val in data["entries"].items():
+                                if alias in mapping and mapping[alias] != val:
+                                    print(f"Error: Alias collision detected for '{alias}' across sidecars without explicit sidecar context.", file=sys.stderr)
+                                    sys.exit(1)
+                                mapping[alias] = val
+                    except Exception as e:
+                        if isinstance(e, CidaError):
+                            raise
+                        print(f"Error reading dictionary {file}: {e}", file=sys.stderr)
+                        sys.exit(5)
 
         results = {}
-        for t in args:
+        for t in tokens_to_translate:
             results[t] = mapping.get(t, "Não encontrado")
         print(results)
     except CidaError as ce:
@@ -82,13 +134,15 @@ def translate_main():
 
 def main():
     try:
-        parser = argparse.ArgumentParser(description="Token-oriented Markdown Minifier for BMAD")
+        parser = CidaArgumentParser(description="Token-oriented Markdown Minifier for BMAD")
         parser.add_argument("--src", required=True, help="Source directory or file")
         parser.add_argument("--dst", required=True, help="Destination directory")
         parser.add_argument("--mode", default="lossless", choices=["lossless", "semantic"], help="Compression mode")
         parser.add_argument("--profile", default="auto", choices=["auto", "code", "java", "markdown", "bmad"], help="Processing profile")
         parser.add_argument("--dictionary-scope", default="file", choices=["none", "file", "corpus"], help="Dictionary scope")
         parser.add_argument("--fail-on-inflation", action="store_true", help="Fail if any file has token count inflation")
+        parser.add_argument("--continue-on-error", action="store_true", help="Continue processing on file errors")
+        parser.add_argument("--no-cache", action="store_true", help="Disable token count and document memoization cache")
         parser.add_argument("--report", default="both", choices=["text", "json", "both"], help="Report format")
         parser.add_argument("--report-path", default="report", help="Report output path (without extension)")
         parser.add_argument("--verify-semantics", action=argparse.BooleanOptionalAction, default=True, help="Run semantic validations")
@@ -97,8 +151,10 @@ def main():
 
         args = parser.parse_args()
 
+        validate_mode_profile_combination(args.mode, args.profile, args.dictionary_scope)
+
         file_repo = PhysicalFilesystem()
-        token_counter = OfflineTokenizer()
+        token_counter = OfflineTokenizer(enable_cache=not args.no_cache)
         hash_service = HashService()
         json_codec = JsonCodec()
 
@@ -107,6 +163,8 @@ def main():
 
         if not file_repo.exists(src_abs):
             raise SourcePathError(f"Source not found: {src_abs}")
+
+        validate_filesystem_safety(src_abs, dst_abs)
 
         java_raw_metrics = []
 
@@ -232,6 +290,7 @@ def main():
                     corpus_hash = ""
 
         inflation_detected = False
+        has_failed_file = False
 
         for filepath in files_to_process:
             start_time = time.time()
@@ -246,12 +305,32 @@ def main():
             try:
                 content = file_repo.read_text(filepath)
             except Exception as e:
-                print(f"Error reading {filepath}: {e}")
+                has_failed_file = True
+                print(f"Error reading {filepath}: {e}", file=sys.stderr)
+                report_gen.add_entry(
+                    filepath=filepath,
+                    profile=args.profile,
+                    tokens_orig=0,
+                    tokens_base=0,
+                    tokens_new=0,
+                    dict_included=False,
+                    tokens_sidecar=0,
+                    tokens_aux=0,
+                    accepted_transforms=[],
+                    rejected_transforms=[],
+                    semantic_status="FAILED",
+                    execution_time=0.0
+                )
+                if not args.continue_on_error:
+                    if isinstance(e, CidaError):
+                        raise
+                    raise CidaError(f"Failed to read file {filepath}: {e}") from e
                 continue
 
             profile = args.profile
             if profile == "auto":
                 profile = file_opt.detect_profile(filepath, content)
+            validate_mode_profile_combination(args.mode, args.profile, args.dictionary_scope, profile)
 
             orig_tokens = token_counter.count(content)
 
@@ -429,7 +508,18 @@ def main():
                 if profile in ["java", "code"] and not dest_path.endswith('.tknc'):
                     dest_path += '.tknc'
 
-                file_repo.write_bytes(dest_path, final_text.encode('utf-8'))
+                text_to_write = final_text
+                if dict_included and best_sidecar_data is not None:
+                    sidecar_ref = file_repo.basename(dest_path) + ".cidatkn"
+                    text_to_write = create_compressed_envelope(
+                        payload=final_text,
+                        sidecar_ref=sidecar_ref,
+                        source_sha256=best_sidecar_data["source_sha256"],
+                        mode=args.mode,
+                        strategy="dictionary"
+                    )
+
+                file_repo.write_bytes(dest_path, text_to_write.encode('utf-8'))
 
                 if dict_included and best_sidecar_data is not None:
                     sidecar_path = dest_path + ".cidatkn"
@@ -464,9 +554,16 @@ def main():
         if not args.dry_run:
             sidecar_val.verify_destination_sidecars(src_abs, dst_abs)
 
+        if has_failed_file:
+            print("Error: One or more files failed to process during execution.", file=sys.stderr)
+            sys.exit(6)
+
     except CidaError as ce:
         print(f"CIDA execution error: {ce}", file=sys.stderr)
         sys.exit(ce.exit_code)
     except Exception as e:
         print(f"Fatal error in CIDA CLI: {e}", file=sys.stderr)
         sys.exit(6)
+
+if __name__ == "__main__":
+    main()
