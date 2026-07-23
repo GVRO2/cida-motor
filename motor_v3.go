@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,8 +11,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -70,19 +70,39 @@ func runPythonCommand(args ...string) *exec.Cmd {
 	return cmd
 }
 
-func estimarTokens(texto string) int {
+func estimarTokens(texto string) (int, error) {
 	if texto == "" {
-		return 0
+		return 0, nil
 	}
 	cmd := runPythonCommand(getToolPath("token_counter.py"))
 	cmd.Stdin = strings.NewReader(texto)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		return 0
+		var exitCode int = 2
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+			if exitCode == 0 {
+				exitCode = 2
+			}
+		}
+		return 0, fmt.Errorf("tokenizer failed with exit code %d: %s", exitCode, strings.TrimSpace(stderr.String()))
 	}
-	tokens, _ := strconv.Atoi(strings.TrimSpace(string(out)))
-	return tokens
+	outStr := strings.TrimSpace(string(out))
+	if outStr == "" {
+		return 0, fmt.Errorf("tokenizer returned empty output")
+	}
+	tokens, err := strconv.Atoi(outStr)
+	if err != nil {
+		return 0, fmt.Errorf("tokenizer output is not numeric: %q", outStr)
+	}
+	if tokens < 0 {
+		return 0, fmt.Errorf("tokenizer output is negative: %d", tokens)
+	}
+	return tokens, nil
 }
+
 
 func calcularTER(tokens int, caracteres int) float64 {
 	if caracteres > 0 {
@@ -186,7 +206,7 @@ func isBinaryFileGo(filePath string) bool {
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Println("Uso: motor_v3 <pasta_original> [pasta_destino] [flags]")
-		return
+		os.Exit(1)
 	}
 
 	// Default choices
@@ -196,7 +216,7 @@ func main() {
 	profile := "auto"
 	dictScope := "file"
 	failOnInflation := false
-	reportFormat := "text"
+	reportFormat := "both"
 	reportPath := ""
 	verifySemantics := true
 	dryRun := false
@@ -236,20 +256,45 @@ func main() {
 			reportPath = args[i+1]
 			i++
 		} else if strings.HasPrefix(arg, "-") {
-			// Ignore other unknown flags or print info
+			fmt.Printf("❌ Erro: Flag desconhecida: %s\n", arg)
+			os.Exit(1)
 		} else {
 			positional = append(positional, arg)
 		}
 	}
 
+	validProfiles := map[string]bool{"auto": true, "code": true, "java": true, "markdown": true, "bmad": true}
+	if !validProfiles[profile] {
+		fmt.Printf("❌ Erro: Perfil inválido: %s\n", profile)
+		os.Exit(1)
+	}
+
+	validDictScopes := map[string]bool{"none": true, "file": true, "corpus": true}
+	if !validDictScopes[dictScope] {
+		fmt.Printf("❌ Erro: Escopo do dicionário inválido: %s\n", dictScope)
+		os.Exit(1)
+	}
+
+	validReports := map[string]bool{"text": true, "json": true, "both": true}
+	if !validReports[reportFormat] {
+		fmt.Printf("❌ Erro: Formato de relatório inválido: %s\n", reportFormat)
+		os.Exit(1)
+	}
+
 	if len(positional) < 1 {
 		fmt.Println("Uso: motor_v3 <pasta_original> [pasta_destino] [flags]")
-		return
+		os.Exit(1)
 	}
 
 	pastaOrig = positional[0]
 	if len(positional) > 1 {
 		pastaComp = positional[1]
+	}
+
+	// Verify pastaOrig existence
+	if _, err := os.Stat(pastaOrig); os.IsNotExist(err) {
+		fmt.Printf("❌ Erro: Diretório ou arquivo de origem não encontrado: %s\n", pastaOrig)
+		os.Exit(4)
 	}
 
 	if pastaComp == "" {
@@ -298,17 +343,29 @@ func main() {
 	}
 }
 
+type JavaRawMetric struct {
+	Filepath         string `json:"filepath"`
+	OriginalContent  string `json:"original_content"`
+	MinifiedContent  string `json:"minified_content"`
+	ElapsedNs        int64  `json:"elapsed_ns"`
+	DictIncluded     bool   `json:"dict_included"`
+	TokensDict       int    `json:"tokens_dict"`
+	TokensSidecar    int    `json:"tokens_sidecar"`
+	TokensAuxiliares int    `json:"tokens_auxiliares"`
+}
+
 func processarEComparar(pastaOrig string, pastaComp string, profile string, dictScope string, failOnInflation bool, reportFormat string, reportPath string, verifySemantics bool, dryRun bool) {
 	absOrig, _ := filepath.Abs(pastaOrig)
 	absComp, _ := filepath.Abs(pastaComp)
 
-	if _, err := os.Stat(absComp); os.IsNotExist(err) && !dryRun {
+	dirIsEmpty := true
+	if entries, err := os.ReadDir(absComp); err == nil && len(entries) > 0 {
+		dirIsEmpty = false
+	}
+	if _, err := os.Stat(absComp); (os.IsNotExist(err) || dirIsEmpty) && !dryRun {
 		fmt.Printf("📂 Criando pasta de destino: %s\n", absComp)
 		os.MkdirAll(absComp, 0755)
-		os.MkdirAll(filepath.Join(absComp, "tknd"), 0755)
 		criarReadmeMinificado(absComp, absOrig)
-		criarReadmeTknd(filepath.Join(absComp, "tknd"))
-		gerarScriptTraducao(absComp)
 	}
 
 	// 1. Scan files
@@ -336,13 +393,191 @@ func processarEComparar(pastaOrig string, pastaComp string, profile string, dict
 				javaFiles = append(javaFiles, absPath)
 			} else if strings.HasSuffix(strings.ToLower(absPath), ".md") || strings.HasSuffix(strings.ToLower(absPath), ".txt") {
 				mdFiles = append(mdFiles, absPath)
+			} else {
+				// Unsupported text file - preserve/copy it directly and log
+				fmt.Printf("⚠️ File format not supported for optimization: preserving original %s\n", absPath)
+				binaryFiles = append(binaryFiles, absPath)
 			}
 		}
 		return nil
 	})
 
-	// 2. Process Markdown files in batch using Python
-	if len(mdFiles) > 0 || profile == "markdown" || profile == "bmad" {
+	// 2. Process Java files natively in Go
+	var javaMetrics []JavaRawMetric
+	var tempJavaJsonPath string
+
+	if len(javaFiles) > 0 && (profile == "auto" || profile == "java" || profile == "code") {
+		fmt.Println("⏳ Otimizando arquivos Java...")
+		
+		corpusHash, err := buildCorpusManifestHash(absOrig, javaFiles)
+		if err != nil {
+			fmt.Printf("❌ Erro ao gerar manifesto do corpus Java: %v\n", err)
+			os.Exit(6)
+		}
+		
+		dicionario, sidecars := construirDicionario(absOrig, javaFiles, corpusHash)
+		
+		type fileInfo struct {
+			relPath         string
+			destPath        string
+			originalContent string
+			minifiedContent string
+			origTokens      int
+			miniTokens      int
+			elapsedNs       int64
+		}
+		
+		var infos []fileInfo
+		var origTokensTotal int = 0
+		var miniTokensTotal int = 0
+		
+		for _, fp := range javaFiles {
+			relPath, _ := filepath.Rel(absOrig, fp)
+			destPath := filepath.Join(absComp, relPath) + ".tknc"
+			
+			contentBytes, err := os.ReadFile(fp)
+			if err != nil {
+				continue
+			}
+			contentStr := string(contentBytes)
+			origTok, err := estimarTokens(contentStr)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Erro no tokenizer ao processar original %s: %v\n", fp, err)
+				os.Exit(2)
+			}
+			
+			start := time.Now()
+			minified := minificarCodigoParaIA(contentStr, dicionario)
+			elapsed := time.Since(start).Nanoseconds()
+			
+			miniTok, err := estimarTokens(minified)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Erro no tokenizer ao processar minificado %s: %v\n", fp, err)
+				os.Exit(2)
+			}
+			
+			infos = append(infos, fileInfo{
+				relPath:         relPath,
+				destPath:        destPath,
+				originalContent: contentStr,
+				minifiedContent: minified,
+				origTokens:      origTok,
+				miniTokens:      miniTok,
+				elapsedNs:       elapsed,
+			})
+			origTokensTotal += origTok
+			miniTokensTotal += miniTok
+		}
+		
+		var sidecarTokensTotal int = 0
+		for _, sidecar := range sidecars {
+			sidecarBytes, _ := json.MarshalIndent(sidecar, "", "    ")
+			toks, err := estimarTokens(string(sidecarBytes))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Erro no tokenizer ao processar sidecar: %v\n", err)
+				os.Exit(2)
+			}
+			sidecarTokensTotal += toks
+		}
+		
+		translateTokens, err := estimarTokens(getTranslatePyContent())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Erro no tokenizer ao processar tradutor: %v\n", err)
+			os.Exit(2)
+		}
+		
+		totalOverhead := sidecarTokensTotal + translateTokens
+		grossSavings := origTokensTotal - miniTokensTotal
+		netSavings := grossSavings - totalOverhead
+		
+		var useDictionary bool = false
+		if netSavings > 0 {
+			useDictionary = true
+			fmt.Printf("✓ Java corpus optimization has net token savings: %d tokens. Applying dictionary minification.\n", netSavings)
+		} else {
+			useDictionary = false
+			fmt.Printf("⚠️ Java corpus optimization yields no net gain (net savings: %d tokens). Reverting to original source.\n", netSavings)
+		}
+		
+		var distributedSidecarSum int = 0
+		var distributedAuxSum int = 0
+		for idx, info := range infos {
+			var dictIncluded bool = false
+			var tokensSidecar int = 0
+			var tokensAux int = 0
+			var finalContent string
+			
+			if useDictionary {
+				dictIncluded = true
+				if origTokensTotal > 0 {
+					if idx == len(infos)-1 {
+						tokensSidecar = sidecarTokensTotal - distributedSidecarSum
+						tokensAux = translateTokens - distributedAuxSum
+					} else {
+						tokensSidecar = int(float64(sidecarTokensTotal) * float64(info.origTokens) / float64(origTokensTotal))
+						tokensAux = int(float64(translateTokens) * float64(info.origTokens) / float64(origTokensTotal))
+						distributedSidecarSum += tokensSidecar
+						distributedAuxSum += tokensAux
+					}
+				}
+				finalContent = info.minifiedContent
+			} else {
+				dictIncluded = false
+				tokensSidecar = 0
+				tokensAux = 0
+				finalContent = info.originalContent
+			}
+			
+			if !dryRun {
+				os.MkdirAll(filepath.Dir(info.destPath), 0755)
+				contentToSave := strings.ReplaceAll(finalContent, "\r\n", "\n")
+				os.WriteFile(info.destPath, []byte(contentToSave), 0644)
+			}
+			
+			javaMetrics = append(javaMetrics, JavaRawMetric{
+				Filepath:         info.relPath,
+				OriginalContent:  info.originalContent,
+				MinifiedContent:  finalContent,
+				ElapsedNs:        info.elapsedNs,
+				DictIncluded:     dictIncluded,
+				TokensDict:       tokensSidecar + tokensAux,
+				TokensSidecar:    tokensSidecar,
+				TokensAuxiliares: tokensAux,
+			})
+		}
+		
+		if useDictionary && !dryRun {
+			tkndDir := filepath.Join(absComp, "tknd")
+			os.MkdirAll(tkndDir, 0755)
+			criarReadmeTknd(tkndDir)
+			for startID, sidecar := range sidecars {
+				fileName := fmt.Sprintf("%s.cidatkn", startID)
+				fileBytes, _ := json.MarshalIndent(sidecar, "", "    ")
+				os.WriteFile(filepath.Join(tkndDir, fileName), fileBytes, 0644)
+			}
+			gerarScriptTraducao(absComp)
+		}
+		
+		if len(javaMetrics) > 0 {
+			javaMetricsJson, err := json.Marshal(javaMetrics)
+			if err == nil {
+				if dryRun {
+					tempDir, err := os.MkdirTemp("", "cida_dryrun_*")
+					if err == nil {
+						tempJavaJsonPath = filepath.Join(tempDir, ".cida_java_raw.json")
+						os.WriteFile(tempJavaJsonPath, javaMetricsJson, 0644)
+						defer os.RemoveAll(tempDir)
+					}
+				} else {
+					tempJavaJsonPath = filepath.Join(absComp, ".cida_java_raw.json")
+					os.WriteFile(tempJavaJsonPath, javaMetricsJson, 0644)
+				}
+			}
+		}
+	}
+
+	// 3. Process Markdown files in batch using Python and compile report
+	if len(mdFiles) > 0 || len(javaFiles) > 0 || profile == "markdown" || profile == "bmad" || profile == "java" {
 		fmt.Println("⏳ Otimizando arquivos Markdown/BMAD via Python Core...")
 		
 		pyArgs := []string{
@@ -363,58 +598,24 @@ func processarEComparar(pastaOrig string, pastaComp string, profile string, dict
 		if dryRun {
 			pyArgs = append(pyArgs, "--dry-run")
 		}
+		// If Java files were processed, pass the raw json parameter
+		if _, err := os.Stat(filepath.Join(absComp, ".cida_java_raw.json")); err == nil {
+			pyArgs = append(pyArgs, "--java-raw-json", filepath.Join(absComp, ".cida_java_raw.json"))
+		}
 
 		cmd := runPythonCommand(pyArgs...)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
-			fmt.Printf("⚠️ Erro ao executar o otimizador Python: %v\n", err)
+			if exitError, ok := err.(*exec.ExitError); ok {
+				exitCode := exitError.ExitCode()
+				fmt.Printf("⚠️ Otimizador Python falhou com código: %d\n", exitCode)
+				os.Exit(exitCode)
+			} else {
+				fmt.Printf("⚠️ Erro ao executar o otimizador Python: %v\n", err)
+				os.Exit(6) // Subprocess error
+			}
 		}
-	}
-
-	// 3. Process Java files natively in Go
-	if len(javaFiles) > 0 && (profile == "auto" || profile == "java" || profile == "code") {
-		fmt.Println("⏳ Otimizando arquivos Java...")
-		dicionario := construirDicionario(absOrig, absComp)
-		
-		var wg sync.WaitGroup
-		var totalFiles = int64(len(javaFiles))
-		var processedFiles int64 = 0
-		jobs := make(chan string, len(javaFiles))
-		
-		numWorkers := 32
-		if numWorkers > len(javaFiles) {
-			numWorkers = len(javaFiles)
-		}
-		
-		for range numWorkers {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for filePath := range jobs {
-					relPath, _ := filepath.Rel(absOrig, filePath)
-					destPath := filepath.Join(absComp, relPath) + ".tknc"
-					
-					if !dryRun {
-						os.MkdirAll(filepath.Dir(destPath), 0755)
-						conteudo, _ := os.ReadFile(filePath)
-						minificado := minificarCodigoParaIA(string(conteudo), dicionario)
-						os.WriteFile(destPath, []byte(minificado), 0644)
-					}
-					
-					count := atomic.AddInt64(&processedFiles, 1)
-					remaining := totalFiles - count
-					fmt.Printf("\rProcessando Java: %d/%d (Faltam: %d arquivos)...", count, totalFiles, remaining)
-				}
-			}()
-		}
-		
-		for _, file := range javaFiles {
-			jobs <- file
-		}
-		close(jobs)
-		wg.Wait() // Wait for all workers to complete!
-		fmt.Printf("\n✓ %d arquivos Java processados.\n", len(javaFiles))
 	}
 
 	// 4. Copy binary files
@@ -431,8 +632,7 @@ func processarEComparar(pastaOrig string, pastaComp string, profile string, dict
 }
 
 func criarReadmeMinificado(pastaDestino string, pastaOrigem string) {
-	absPath, _ := filepath.Abs(pastaOrigem)
-	conteudo := fmt.Sprintf(`# ⚠️ PROJETO MINIFICADO - SOMENTE LEITURA
+	conteudo := `# ⚠️ PROJETO MINIFICADO - SOMENTE LEITURA
 
 Este diretório contém uma versão otimizada (minificada) do seu código, gerada automaticamente para reduzir drasticamente o consumo de tokens em modelos de linguagem (LLMs).
 
@@ -441,14 +641,14 @@ Este diretório contém uma versão otimizada (minificada) do seu código, gerad
 1. LEIA APENAS ESTA PASTA (Minificada): Use os arquivos nesta pasta como contexto. Eles foram processados pelo motor de minificação e contêm o comportamento puro do sistema.
 
 2. EDITE APENAS A PASTA ORIGINAL (Não Minificada): Todas as alterações, refatorações, correções de bugs e novas funcionalidades devem ser feitas exclusivamente na pasta fonte original:
-   %s
+   <ORIGINAL_SOURCE_ROOT>
 
 3. NUNCA EDITE ARQUIVOS NESTA PASTA: Esta pasta é gerenciada por um motor automático. Qualquer alteração manual aqui será sobrescrita na próxima execução da compilação.
 
 ## 🤖 Orientações para a I.A.
 - Ferramenta de Tradução (translate.py): Caso seja estritamente necessário entender um identificador, utilize o script 'translate.py' na raiz do projeto original. *AVISO: Use esta ferramenta apenas quando necessário e armazene a tradução em seu contexto imediato para evitar chamadas redundantes.*
 - Edição: As sugestões de código devem ser baseadas na estrutura da pasta original.
-`, absPath)
+`
 	
 	os.WriteFile(filepath.Join(pastaDestino, "README_MINIFICADO.md"), []byte(conteudo), 0644)
 	os.WriteFile(filepath.Join(pastaDestino, "CONSTITUTION.md"), []byte(getConstitutionContent()), 0644)
@@ -463,7 +663,7 @@ Este diretório contém o mapeamento completo entre os identificadores ofuscados
 
 ## Estrutura dos Arquivos
 Os arquivos estão segmentados em blocos de 500 registros para facilitar a consulta pela I.A. 
-Cada arquivo é nomeado de acordo com o identificador do primeiro token contido nele (ex: A0.tknd contém os mapeamentos de A0 a A1F3...).
+Cada arquivo é nomeado de acordo com o identificador do primeiro token contido nele (ex: A0.cidatkn contém os mapeamentos de A0 a A1F3...).
 
 ## Como utilizar
 Sempre que encontrar um identificador ofuscado (ex: A5), procure no arquivo correspondente dentro desta pasta para identificar sua função ou nome original.
@@ -512,22 +712,94 @@ Caso seja estritamente necessário entender um identificador, utilize o script '
 `
 }
 
-func gerarScriptTraducao(pastaDestino string) {
-	conteudo := `import os
+type SidecarData struct {
+	Format       string            `json:"format"`
+	Version      int               `json:"version"`
+	Source       string            `json:"source"`
+	SourceSha256 string            `json:"source_sha256"`
+	Entries      map[string]string `json:"entries"`
+}
+
+type ManifestFile struct {
+	Path   string `json:"path"`
+	Sha256 string `json:"sha256"`
+}
+
+type Manifest struct {
+	Files []ManifestFile `json:"files"`
+}
+
+func fileSHA256(filePath string) (string, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", err
+	}
+	hash := sha256.Sum256(data)
+	return fmt.Sprintf("%x", hash), nil
+}
+
+func buildCorpusManifestHash(absOrig string, javaFiles []string) (string, error) {
+	var files []ManifestFile
+	for _, fp := range javaFiles {
+		relPath, err := filepath.Rel(absOrig, fp)
+		if err != nil {
+			return "", err
+		}
+		relPath = filepath.ToSlash(relPath)
+		sha, err := fileSHA256(fp)
+		if err != nil {
+			return "", err
+		}
+		files = append(files, ManifestFile{
+			Path:   relPath,
+			Sha256: sha,
+		})
+	}
+	
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].Path < files[j].Path
+	})
+	
+	manifest := Manifest{Files: files}
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		return "", err
+	}
+	
+	hash := sha256.Sum256(manifestBytes)
+	return fmt.Sprintf("%x", hash), nil
+}
+
+func getTranslatePyContent() string {
+	return `import os
 import sys
+import json
+
+def reject_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Duplicate JSON key: {key}")
+        result[key] = value
+    return result
 
 def translate(tokens, tknd_dir):
     mapping = {}
     if not os.path.exists(tknd_dir):
-        return f"Erro: Pasta {tknd_dir} não encontrada."
+        print(f"Erro: Pasta {tknd_dir} não encontrada.", file=sys.stderr)
+        sys.exit(5)
     
     for file in os.listdir(tknd_dir):
-        if file.endswith(".tknd"):
-            with open(os.path.join(tknd_dir, file), 'r', encoding='utf-8') as f:
-                for line in f:
-                    parts = line.strip().split('=')
-                    if len(parts) == 2:
-                        mapping[parts[0]] = parts[1]
+        if file.endswith(".cidatkn"):
+            try:
+                with open(os.path.join(tknd_dir, file), 'r', encoding='utf-8') as f:
+                    data = json.load(f, object_pairs_hook=reject_duplicate_keys)
+                    if isinstance(data, dict) and "entries" in data:
+                        for alias, val in data["entries"].items():
+                            mapping[alias] = val
+            except Exception as e:
+                print(f"Erro ao ler dicionário {file}: {e}", file=sys.stderr)
+                sys.exit(5)
     
     results = {}
     for t in tokens:
@@ -549,30 +821,42 @@ if __name__ == "__main__":
         
         print(translate(args, tknd_dir))
 `
+}
+
+func gerarScriptTraducao(pastaDestino string) {
+	conteudo := getTranslatePyContent()
 	os.WriteFile(filepath.Join(pastaDestino, "translate.py"), []byte(conteudo), 0755)
 }
 
-func construirDicionario(pastaOrig string, pastaComp string) map[string]string {
+func construirDicionario(pastaOrig string, javaFiles []string, corpusHash string) (map[string]string, map[string]SidecarData) {
 	contador := make(map[string]int)
 	rePalavras := regexp.MustCompile(`\b[a-zA-Z_]{6,}\b`)
 
-	filepath.WalkDir(pastaOrig, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() { return nil }
-		if isBinaryFileGo(path) { return nil }
-		conteudo, _ := os.ReadFile(path)
+	for _, path := range javaFiles {
+		conteudo, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
 		palavras := rePalavras.FindAllString(string(conteudo), -1)
-		for _, p := range palavras { contador[p]++ }
-		return nil
-	})
+		for _, p := range palavras {
+			contador[p]++
+		}
+	}
 
 	type kv struct { Key string; Freq int }
 	var ss []kv
 	for k, v := range contador { ss = append(ss, kv{k, v}) }
 	sort.Slice(ss, func(i, j int) bool {
-		return ss[i].Freq*len(ss[i].Key) > ss[j].Freq*len(ss[j].Key)
+		scoreI := ss[i].Freq * len(ss[i].Key)
+		scoreJ := ss[j].Freq * len(ss[j].Key)
+		if scoreI == scoreJ {
+			return ss[i].Key < ss[j].Key
+		}
+		return scoreI > scoreJ
 	})
 
 	dicionario := make(map[string]string)
+	sidecars := make(map[string]SidecarData)
 	
 	for i := 0; i < len(ss); i += 500 {
 		end := i + 500
@@ -581,17 +865,36 @@ func construirDicionario(pastaOrig string, pastaComp string) map[string]string {
 		}
 		
 		startID := getB16ID(i)
-		fileName := fmt.Sprintf("%s.tknd", startID)
-		file, _ := os.Create(filepath.Join(pastaComp, "tknd", fileName))
 		
+		var entries []struct{ Alias, Value string }
 		for j := i; j < end; j++ {
 			if ss[j].Freq >= 3 {
 				token := getB16ID(j)
 				dicionario[ss[j].Key] = token
-				file.WriteString(fmt.Sprintf("%s=%s\n", token, ss[j].Key))
+				entries = append(entries, struct{ Alias, Value string }{token, ss[j].Key})
 			}
 		}
-		file.Close()
+		
+		if len(entries) > 0 {
+			sort.Slice(entries, func(x, y int) bool {
+				return entries[x].Alias < entries[y].Alias
+			})
+			
+			entriesMap := make(map[string]string)
+			for _, entry := range entries {
+				entriesMap[entry.Alias] = entry.Value
+			}
+			
+			sidecar := SidecarData{
+				Format:       "cida-token-sidecar",
+				Version:      1,
+				Source:       "corpus",
+				SourceSha256: corpusHash,
+				Entries:      entriesMap,
+			}
+			
+			sidecars[startID] = sidecar
+		}
 	}
-	return dicionario
+	return dicionario, sidecars
 }

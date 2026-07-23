@@ -15,7 +15,7 @@ This is the main workflow file containing instructions for the BMAD agent.
 3. [ ] Run validation tests
 
 <!-- Operational comment: stepsCompleted=[0] -->
-
+<!-- Non-operational comment: this is purely visual decoration -->
 
 > [!NOTE]
 > Please follow the path instructions carefully inside `steps-c/` directory.

@@ -1,155 +1,22 @@
-import re
-import string
-import tiktoken
+from cida.markdown.dictionary import generate_alias_candidates, find_candidate_words, build_file_dictionary as build_file_dict_pure, apply_dictionary
+from cida.infrastructure.tokenizer import OfflineTokenizer
 
-_enc = None
+_tokenizer = OfflineTokenizer()
+
+__all__ = [
+    "get_encoder",
+    "count_tokens",
+    "generate_alias_candidates",
+    "find_candidate_words",
+    "build_file_dictionary",
+    "apply_dictionary",
+]
 
 def get_encoder():
-    global _enc
-    if _enc is None:
-        # Assumes TIKTOKEN_CACHE_DIR is set to point to the local cache folder
-        _enc = tiktoken.get_encoding("cl100k_base")
-    return _enc
+    return _tokenizer.get_encoder()
 
 def count_tokens(text):
-    if not text:
-        return 0
-    return len(get_encoder().encode(text))
-
-def generate_alias_candidates(exclude_set, limit=5000):
-    """
-    Generates a list of sorted, deterministic alias candidates (letters only)
-    excluding any strings present in exclude_set.
-    """
-    letters = string.ascii_letters # a-zA-Z
-    candidates = []
-    
-    # 2-letter uppercase combinations (AA - ZZ)
-    for c1 in string.ascii_uppercase:
-        for c2 in string.ascii_uppercase:
-            cand = c1 + c2
-            if cand not in exclude_set:
-                candidates.append(cand)
-                if len(candidates) >= limit:
-                    return candidates
-                    
-    # 2-letter lowercase combinations (aa - zz)
-    for c1 in string.ascii_lowercase:
-        for c2 in string.ascii_lowercase:
-            cand = c1 + c2
-            if cand not in exclude_set:
-                candidates.append(cand)
-                if len(candidates) >= limit:
-                    return candidates
-
-    # 3-letter uppercase combinations (AAA - ZZZ)
-    for c1 in string.ascii_uppercase:
-        for c2 in string.ascii_uppercase:
-            for c3 in string.ascii_uppercase:
-                cand = c1 + c2 + c3
-                if cand not in exclude_set:
-                    candidates.append(cand)
-                    if len(candidates) >= limit:
-                        return candidates
-                        
-    return candidates
-
-def find_candidate_words(text):
-    """
-    Finds words of length >= 6 (only letters and underscores) that could be dictionary keys.
-    """
-    return re.findall(r'\b[a-zA-Z_]{6,}\b', text)
+    return _tokenizer.count(text)
 
 def build_file_dictionary(text, protected_manager, min_margin=5):
-    """
-    Builds a local dictionary for a single file.
-    Only includes mappings that yield a net positive token gain.
-    """
-    # 1. Protect regions first so we don't check/replace in them
-    protected_text = protected_manager.protect(text)
-    
-    # 2. Words in the entire document (to exclude from aliases)
-    exclude_set = set(re.findall(r'\b\w+\b', text))
-    
-    # 3. Find candidate words for substitution in the protected text
-    candidate_words = find_candidate_words(protected_text)
-    if not candidate_words:
-        return {}, ""
-        
-    from collections import Counter
-    word_counts = Counter(candidate_words)
-    
-    # Generate potential aliases
-    aliases = generate_alias_candidates(exclude_set, limit=len(word_counts) + 10)
-    
-    # Calculate gain for each candidate word
-    candidates_with_gain = []
-    alias_idx = 0
-    
-    # Sort candidate words by frequency * length to prioritize highest impact
-    sorted_words = sorted(word_counts.items(), key=lambda x: x[1] * len(x[0]), reverse=True)
-    
-    dict_overhead = count_tokens("> 🤖 AI RAG DICT: \n\n")
-    current_dict = {}
-    temp_aliases = []
-    
-    for word, freq in sorted_words:
-        if freq < 2:
-            continue
-            
-        if alias_idx >= len(aliases):
-            break
-            
-        alias = aliases[alias_idx]
-        
-        # Calculate tokens
-        tokens_word = count_tokens(word)
-        tokens_alias = count_tokens(alias)
-        
-        # Gross gain from replacing W with A in the body
-        gross_gain = freq * (tokens_word - tokens_alias)
-        
-        # Cost of writing 'A=W, ' in the header
-        entry_cost = count_tokens(f"{alias}={word}, ")
-        
-        net_word_gain = gross_gain - entry_cost
-        if net_word_gain > 0:
-            candidates_with_gain.append((word, alias, net_word_gain))
-            alias_idx += 1
-            
-    if not candidates_with_gain:
-        return {}, ""
-        
-    # Check if total gain exceeds base overhead + min_margin
-    total_gain = sum(g for _, _, g in candidates_with_gain)
-    if total_gain <= (dict_overhead + min_margin):
-        return {}, ""
-        
-    # Construct final dictionary
-    final_dict = {word: alias for word, alias, _ in candidates_with_gain}
-    
-    # Form header string
-    rag_str = ", ".join(f"{alias}={word}" for word, alias in final_dict.items())
-    header = f"> 🤖 AI RAG DICT: {rag_str}\n\n"
-    
-    return final_dict, header
-
-def apply_dictionary(text, dictionary, protected_manager):
-    """
-    Applies the dictionary to the text, keeping protected regions safe.
-    """
-    if not dictionary:
-        return text
-        
-    # Protect first
-    protected_text = protected_manager.protect(text)
-    
-    # Apply substitutions in order of length (longest first) to prevent partial replacement issues
-    sorted_dict = sorted(dictionary.items(), key=lambda x: len(x[0]), reverse=True)
-    for word, alias in sorted_dict:
-        # Use regex word boundaries to avoid replacing substrings of other words
-        pattern = re.compile(rf'\b{re.escape(word)}\b')
-        protected_text = pattern.sub(alias, protected_text)
-        
-    # Restore protected regions
-    return protected_manager.restore(protected_text)
+    return build_file_dict_pure(text, protected_manager, _tokenizer, min_margin)
