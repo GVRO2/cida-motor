@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+env:
+  TIKTOKEN_CACHE_DIR: ${{ github.workspace }}/resources
+
 jobs:
   test:
     name: Test on ${{ matrix.os }}
@@ -174,7 +177,9 @@ jobs:
         mkdir -p /tmp/go_lossless_test_src
         echo 'public class Foo { void bar() {} }' > /tmp/go_lossless_test_src/Foo.java
         exit_code=0
+        set +e
         ./motor_v3_test_bin /tmp/go_lossless_test_src /tmp/go_lossless_test_dst --mode=lossless 2>&1; exit_code=$?
+        set -e
         python -c "import sys; code=$exit_code; sys.exit(0) if code in (1,4,5) else sys.exit(f'Expected exit 1/4/5, got {code}')"
         if [ -d /tmp/go_lossless_test_dst ]; then
           echo "ERROR: destination directory was unexpectedly created"
@@ -193,6 +198,8 @@ jobs:
     steps:
     - name: Check out code
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
 
     - name: Set up Go
       uses: actions/setup-go@v5
