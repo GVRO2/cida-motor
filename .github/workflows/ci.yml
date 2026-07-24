@@ -51,6 +51,9 @@ jobs:
     - name: Run Python tests
       run: python -m pytest -q
 
+    - name: Validation Levels and Harness Decoupling
+      run: python -m pytest tests/test_validation_levels.py tests/test_runtime_harness_decoupling.py -q
+
     - name: Static Analysis
       run: |
         python -m ruff check .
@@ -208,8 +211,11 @@ jobs:
     - name: Run Benchmarks and Generate Manifest
       run: python benchmarks/benchmark_runner.py --manifest-out manifest-${{ matrix.os }}.json
 
-    - name: Performance Regression Gate
-      run: python benchmarks/performance_compare.py --base-ref origin/main --runs 5 --warmups 1 --output performance-${{ matrix.os }}.json
+    - name: Balanced Performance Regression Gate
+      run: python benchmarks/performance_compare.py --base-ref origin/main --runs 5 --warmups 1 --validation-level balanced --output performance-balanced-${{ matrix.os }}.json
+
+    - name: Strict Validation Benchmark
+      run: python benchmarks/performance_compare.py --base-ref origin/main --runs 5 --warmups 1 --validation-level strict --output performance-strict-${{ matrix.os }}.json
 
     - name: Clean Workspace Gate
       run: python scripts/check_clean_workspace.py
@@ -225,7 +231,9 @@ jobs:
       if: always()
       with:
         name: performance-${{ matrix.os }}
-        path: performance-${{ matrix.os }}.json
+        path: |
+          performance-balanced-${{ matrix.os }}.json
+          performance-strict-${{ matrix.os }}.json
 
   compare:
     name: Compare Manifests
