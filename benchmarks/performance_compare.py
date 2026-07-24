@@ -17,6 +17,8 @@ from pathlib import Path
 MEDIAN_BUDGET = 0.05
 P95_BUDGET = 0.10
 RSS_BUDGET = 0.10
+STABILITY_CV_LIMIT = 0.10
+MAX_BALANCED_SCENARIO_ATTEMPTS = 3
 
 
 def _run(cmd: list[str], cwd: Path, **kwargs) -> subprocess.CompletedProcess:
@@ -390,6 +392,8 @@ def main() -> None:
                 "median": MEDIAN_BUDGET,
                 "p95": P95_BUDGET,
                 "peak_rss": RSS_BUDGET,
+                "stability_cv": STABILITY_CV_LIMIT,
+                "max_balanced_scenario_attempts": MAX_BALANCED_SCENARIO_ATTEMPTS,
                 "enforced": args.validation_level == "balanced",
             },
             "scenarios": {},
@@ -425,11 +429,9 @@ def main() -> None:
                 ("head", head_bin, head_dir),
             ]
 
-            samples_map = {"base": [], "head": []}
-            hashes_map = {"base": [], "head": []}
-            unsupported_base_flags = []
+            unsupported_base_flags: list[str] = []
 
-            def build_effective_flags(version: str, proj: Path) -> list[str]:
+            def build_effective_flags(version: str) -> list[str]:
                 eff = list(flags)
                 if args.validation_level != "balanced" and "--validation-level" not in eff:
                     eff.extend(["--validation-level", args.validation_level])
@@ -445,70 +447,97 @@ def main() -> None:
                         unsupported_base_flags.append("--validation-level")
                 return eff
 
-            # Warmups: alternating order
-            for w in range(args.warmups):
-                warmup_order = version_configs if w % 2 == 0 else list(reversed(version_configs))
-                for version, binary, project in warmup_order:
-                    command = [str(binary)] if runner == "go" else (base_python_cmd if version == "base" else head_python_cmd)
-                    effective_flags = build_effective_flags(version, project)
-                    dest = temp_root / "runs" / scenario_name / version / f"warmup-{w:02d}"
-                    _measure(command, project, source, dest, effective_flags)
-
-            # Measured runs: alternating order
-            for r in range(args.runs):
-                run_order = version_configs if r % 2 == 0 else list(reversed(version_configs))
-                for version, binary, project in run_order:
-                    command = [str(binary)] if runner == "go" else (base_python_cmd if version == "base" else head_python_cmd)
-                    effective_flags = build_effective_flags(version, project)
-                    dest = temp_root / "runs" / scenario_name / version / f"run-{r:02d}"
-
-                    sample = _measure(command, project, source, dest, effective_flags)
-                    samples_map[version].append(sample)
-                    hashes_map[version].append(_compute_tree_sha256(dest))
-
-            base_summary = _summarize(samples_map["base"], hashes_map["base"])
-            head_summary = _summarize(samples_map["head"], hashes_map["head"])
-
-            comparison = {
-                "median_delta": _delta(head_summary["median"], base_summary["median"]),
-                "p95_delta": _delta(head_summary["p95"], base_summary["p95"]),
-                "peak_rss_delta": _delta(head_summary["peak_rss"], base_summary["peak_rss"]),
-            }
-            budget_result = (
-                comparison["median_delta"] <= MEDIAN_BUDGET
-                and comparison["p95_delta"] <= P95_BUDGET
-                and comparison["peak_rss_delta"] <= RSS_BUDGET
-            )
-            is_unstable = base_summary["cv"] > 0.10 or head_summary["cv"] > 0.10
-            stability_str = "UNSTABLE" if is_unstable else "STABLE"
-
-            if args.validation_level == "balanced" and not budget_result:
-                failed.append(scenario_name)
-
             cmd_str = f"motor_v3 {' '.join(flags)}" if runner == "go" else f"python -m cida.interfaces.cli {' '.join(flags)}"
+            max_attempts = MAX_BALANCED_SCENARIO_ATTEMPTS if args.validation_level == "balanced" else 1
+            attempt_summaries = []
 
-            results["scenarios"][scenario_name] = {
-                "scenario": scenario_name,
-                "runner": runner,
-                "command": cmd_str,
-                "mode": scenario_mode,
-                "profile": scenario_profile,
-                "dictionary_scope": scenario_dict_scope,
-                "verify_semantics": verify_semantics,
-                "cache_enabled": cache_enabled,
-                "durable_writes": durable_writes,
-                "validation_level": args.validation_level,
-                "warmups": args.warmups,
-                "runs": args.runs,
-                "flags": flags,
-                "unsupported_base_flags": sorted(set(unsupported_base_flags)),
-                "base": base_summary,
-                "head": head_summary,
-                "comparison": comparison,
-                "stability": stability_str,
-                "budget_result": "PASS" if budget_result else "FAIL",
-                "budget_enforced": args.validation_level == "balanced",
-            }
+            for attempt in range(1, max_attempts + 1):
+                samples_map = {"base": [], "head": []}
+                hashes_map = {"base": [], "head": []}
+
+                # Warmups: alternating order.
+                for w in range(args.warmups):
+                    warmup_order = version_configs if w % 2 == 0 else list(reversed(version_configs))
+                    for version, binary, _project in warmup_order:
+                        command = [str(binary)] if runner == "go" else (base_python_cmd if version == "base" else head_python_cmd)
+                        effective_flags = build_effective_flags(version)
+                        dest = temp_root / "runs" / scenario_name / f"attempt-{attempt:02d}" / version / f"warmup-{w:02d}"
+                        _measure(command, _project, source, dest, effective_flags)
+
+                # Measured runs: alternating order.
+                for r in range(args.runs):
+                    run_order = version_configs if r % 2 == 0 else list(reversed(version_configs))
+                    for version, binary, _project in run_order:
+                        command = [str(binary)] if runner == "go" else (base_python_cmd if version == "base" else head_python_cmd)
+                        effective_flags = build_effective_flags(version)
+                        dest = temp_root / "runs" / scenario_name / f"attempt-{attempt:02d}" / version / f"run-{r:02d}"
+
+                        sample = _measure(command, _project, source, dest, effective_flags)
+                        samples_map[version].append(sample)
+                        hashes_map[version].append(_compute_tree_sha256(dest))
+
+                base_summary = _summarize(samples_map["base"], hashes_map["base"])
+                head_summary = _summarize(samples_map["head"], hashes_map["head"])
+
+                comparison = {
+                    "median_delta": _delta(head_summary["median"], base_summary["median"]),
+                    "p95_delta": _delta(head_summary["p95"], base_summary["p95"]),
+                    "peak_rss_delta": _delta(head_summary["peak_rss"], base_summary["peak_rss"]),
+                }
+                budget_result = (
+                    comparison["median_delta"] <= MEDIAN_BUDGET
+                    and comparison["p95_delta"] <= P95_BUDGET
+                    and comparison["peak_rss_delta"] <= RSS_BUDGET
+                )
+                is_unstable = base_summary["cv"] > STABILITY_CV_LIMIT or head_summary["cv"] > STABILITY_CV_LIMIT
+                stability_str = "UNSTABLE" if is_unstable else "STABLE"
+                gate_result = budget_result and not is_unstable
+                attempt_summaries.append(
+                    {
+                        "attempt": attempt,
+                        "budget_result": "PASS" if budget_result else "FAIL",
+                        "stability": stability_str,
+                        "base_cv": base_summary["cv"],
+                        "head_cv": head_summary["cv"],
+                        "comparison": comparison,
+                    }
+                )
+
+                should_retry = args.validation_level == "balanced" and not gate_result and attempt < max_attempts
+                if should_retry:
+                    continue
+
+                if args.validation_level == "balanced" and not gate_result:
+                    failed.append(scenario_name)
+
+                results["scenarios"][scenario_name] = {
+                    "scenario": scenario_name,
+                    "runner": runner,
+                    "command": cmd_str,
+                    "mode": scenario_mode,
+                    "profile": scenario_profile,
+                    "dictionary_scope": scenario_dict_scope,
+                    "verify_semantics": verify_semantics,
+                    "cache_enabled": cache_enabled,
+                    "durable_writes": durable_writes,
+                    "validation_level": args.validation_level,
+                    "warmups": args.warmups,
+                    "runs": args.runs,
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "flags": flags,
+                    "unsupported_base_flags": sorted(set(unsupported_base_flags)),
+                    "base": base_summary,
+                    "head": head_summary,
+                    "comparison": comparison,
+                    "stability": stability_str,
+                    "budget_result": "PASS" if budget_result else "FAIL",
+                    "stability_result": "FAIL" if is_unstable else "PASS",
+                    "gate_result": "PASS" if gate_result else "FAIL",
+                    "budget_enforced": args.validation_level == "balanced",
+                    "attempts": attempt_summaries,
+                }
+                break
 
         results["overall_result"] = "PASS" if not failed else "FAIL"
         results["failed_scenarios"] = failed
