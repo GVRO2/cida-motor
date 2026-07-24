@@ -6,6 +6,7 @@ __pycache__/
 .vscode/
 *.exe
 /motor_v3
+.cida-local/
 .pytest_cache/
 tests/fixtures/bmad_project_mimificado/
 report.json
