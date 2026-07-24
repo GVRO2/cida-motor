@@ -131,17 +131,55 @@ def clean_comments(text):
 def normalize_spaces(text):
     return re.sub(r'\s+', ' ', text.strip())
 
-def validate_semantics(original_text, minified_text, dictionary=None):
+class ParsedOriginalDocument:
+    """Pre-parsed representation of original markdown for fast semantic equivalence checks."""
+
+    def __init__(self, original_text: str):
+        self.original_text = original_text
+        self.orig_error = None
+        self.orig_has_fm = False
+        self.original_clean = ""
+        self.orig_blocks = []
+        self.orig_inline: dict = {"inline_codes": [], "links": [], "placeholders": [], "tags": []}
+        self.orig_all_prot = []
+        self.orig_filtered = []
+
+        try:
+            self.orig_has_fm = has_frontmatter_at_document_start(original_text)
+            self.original_clean = clean_comments(original_text)
+            self.orig_blocks = parse_markdown(self.original_clean)
+
+            # Validate YAML frontmatter in original
+            fm_blocks = [b for b in self.orig_blocks if b.type == "frontmatter"]
+            for b in fm_blocks:
+                parse_yaml_frontmatter_safe(b.content)
+
+            self.orig_inline = extract_inline_elements(self.original_clean)
+            self.orig_all_prot = extract_all_protected_elements(self.original_clean)
+
+            orig_filtered = [b for b in self.orig_blocks if b.type != "blank" and b.type != "comment"]
+            orig_filtered += [b for b in self.orig_blocks if b.type == "comment" and classify_comment(b.content) in ["operational", "unknown"]]
+            self.orig_filtered = sorted(orig_filtered, key=lambda b: self.original_clean.find(b.content))
+        except Exception as e:
+            self.orig_error = f"YAML frontmatter error: {e}"
+
+
+def validate_semantics(original_text, minified_text, dictionary=None, parsed_original=None):
     """
     Validates that the minified Markdown is semantically and structurally equivalent to the original.
     """
     try:
-        orig_has_fm = has_frontmatter_at_document_start(original_text)
+        if parsed_original is None:
+            parsed_original = ParsedOriginalDocument(original_text)
+
+        if parsed_original.orig_error:
+            return False, parsed_original.orig_error
+
+        orig_has_fm = parsed_original.orig_has_fm
         mini_has_fm = has_frontmatter_at_document_start(minified_text)
         if orig_has_fm != mini_has_fm:
             return False, f"Frontmatter presence mismatch: original {orig_has_fm} vs minified {mini_has_fm}"
 
-        original_clean = clean_comments(original_text)
         minified_clean = clean_comments(minified_text)
 
         decompiled_text = minified_clean
@@ -159,20 +197,18 @@ def validate_semantics(original_text, minified_text, dictionary=None):
                 protected_text = pattern.sub(original_word, protected_text)
             decompiled_text = pm.restore(protected_text)
 
-        orig_blocks = parse_markdown(original_clean)
         decomp_blocks = parse_markdown(decompiled_text)
 
-        # 0. Check YAML frontmatter syntax/duplicates first
-        for blocks in [orig_blocks, decomp_blocks]:
-            fm_blocks = [b for b in blocks if b.type == "frontmatter"]
-            for b in fm_blocks:
-                try:
-                    parse_yaml_frontmatter_safe(b.content)
-                except Exception as e:
-                    return False, f"YAML frontmatter error: {e}"
+        # Check YAML frontmatter syntax/duplicates in minified decompiled blocks
+        decomp_fm_blocks = [b for b in decomp_blocks if b.type == "frontmatter"]
+        for b in decomp_fm_blocks:
+            try:
+                parse_yaml_frontmatter_safe(b.content)
+            except Exception as e:
+                return False, f"YAML frontmatter error: {e}"
 
-        # 1. Compare inline elements first for explicit test cases
-        orig_inline = extract_inline_elements(original_clean)
+        # 1. Compare inline elements
+        orig_inline = parsed_original.orig_inline
         decomp_inline = extract_inline_elements(decompiled_text)
 
         for key in ["inline_codes", "links", "placeholders", "tags"]:
@@ -185,7 +221,7 @@ def validate_semantics(original_text, minified_text, dictionary=None):
                     return False, f"Inline element '{key}' mismatch at index {i}: '{oi}' vs '{di}'"
 
         # 2. Check all protected elements (fences, URLs, paths, normative values)
-        orig_all_prot = extract_all_protected_elements(original_clean)
+        orig_all_prot = parsed_original.orig_all_prot
         decomp_all_prot = extract_all_protected_elements(decompiled_text)
         if len(orig_all_prot) != len(decomp_all_prot):
             return False, f"Protected elements count mismatch: original {len(orig_all_prot)} vs minified {len(decomp_all_prot)}"
@@ -193,14 +229,10 @@ def validate_semantics(original_text, minified_text, dictionary=None):
             if oi != di:
                 return False, f"Protected element mismatch at index {i}: '{oi}' vs '{di}'"
 
-        # 3. Parse blocks
-        orig_filtered = [b for b in orig_blocks if b.type != "blank" and b.type != "comment"]
+        # 3. Parse blocks comparison
+        orig_filtered = parsed_original.orig_filtered
         decomp_filtered = [b for b in decomp_blocks if b.type != "blank" and b.type != "comment"]
-
-        orig_filtered += [b for b in orig_blocks if b.type == "comment" and classify_comment(b.content) in ["operational", "unknown"]]
         decomp_filtered += [b for b in decomp_blocks if b.type == "comment" and classify_comment(b.content) in ["operational", "unknown"]]
-
-        orig_filtered = sorted(orig_filtered, key=lambda b: original_clean.find(b.content))
         decomp_filtered = sorted(decomp_filtered, key=lambda b: decompiled_text.find(b.content))
 
         if len(orig_filtered) != len(decomp_filtered):
@@ -283,6 +315,5 @@ def validate_semantics(original_text, minified_text, dictionary=None):
                     return False, f"Paragraph mismatch at index {idx}"
 
         return True, "Success"
-
     except Exception as e:
         return False, f"Semantic validator internal error: {e}"
