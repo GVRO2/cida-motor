@@ -45,9 +45,25 @@ def test_optimize_file_scope_semantic_fail_branch():
     usecase = FileOptimizerUsecase(tok, fs, hs, jc)
     text = "This is regular_word_long repeated. " * 15
 
-    with patch("cida.application.optimize_file.validate_semantics", return_value=(False, "Failed")):
+    with patch("cida.application.optimize_file._load_semantic_dependencies") as load_deps:
+        load_deps.return_value = (lambda original: object(), lambda *args, **kwargs: (False, "Failed"))
         res_text, sidecar, tokens = usecase.optimize_markdown_dictionary_file_scope(text, text, "doc.md", True)
         assert res_text == text
+
+
+def test_optimize_file_scope_loads_semantics_only_when_required():
+    fs = PhysicalFilesystem()
+    tok = OfflineTokenizer(cache_dir="resources")
+    hs = HashService()
+    jc = JsonCodec()
+
+    usecase = FileOptimizerUsecase(tok, fs, hs, jc)
+    text = "This is regular_word_long repeated. " * 15
+
+    with patch("cida.application.optimize_file._load_semantic_dependencies") as load_deps:
+        usecase.optimize_markdown_dictionary_file_scope(text, text, "doc.md", False)
+
+    load_deps.assert_not_called()
 
 def test_optimize_file_scope_sidecar_exception_branch():
     fs = PhysicalFilesystem()
@@ -91,6 +107,33 @@ def test_optimize_corpus_empty_and_exception_branches(tmp_path):
     assert "f1.md" in str(exc_info.value)
 
 
+def test_optimize_corpus_skip_binary_check_applies_to_manifest_hashes():
+    tok = OfflineTokenizer(cache_dir="resources")
+    hs = HashService()
+    jc = JsonCodec()
+    builder = MagicMock()
+    builder.build_corpus_dictionary.return_value = {"regular_word_long": "A0"}
+
+    mock_fs = MagicMock()
+    mock_fs.is_binary_file.side_effect = AssertionError("binary check should be skipped")
+    mock_fs.read_text.return_value = "regular_word_long " * 5
+    mock_fs.read_bytes.return_value = b"regular_word_long " * 5
+    mock_fs.relpath.return_value = "doc.md"
+
+    usecase = CorpusOptimizerUsecase(tok, mock_fs, hs, jc, builder)
+
+    corpus_dict, corpus_hash, sidecar_tokens, auxiliary_tokens = usecase.build_corpus_dict(
+        ["doc.md"],
+        "src",
+        skip_binary_check=True,
+    )
+
+    assert corpus_dict == {"regular_word_long": "A0"}
+    assert corpus_hash
+    assert sidecar_tokens > 0
+    assert auxiliary_tokens > 0
+
+
 def test_optimize_corpus_builds_single_file_inventory(tmp_path):
     fs = PhysicalFilesystem()
     tok = OfflineTokenizer(cache_dir="resources")
@@ -118,6 +161,27 @@ def test_optimize_corpus_builds_single_file_inventory(tmp_path):
     assert str(tmp_path / "script.py") in inventory.processable_files
     assert str(tmp_path / "App.java") not in inventory.processable_files
     assert str(tknd / "ignored.md") not in inventory.processable_files
+
+
+def test_optimize_corpus_inventory_skips_binary_probe_for_supported_text_extensions():
+    tok = OfflineTokenizer(cache_dir="resources")
+    hs = HashService()
+    jc = JsonCodec()
+    builder = MagicMock()
+    mock_fs = MagicMock()
+    mock_fs.is_file.return_value = False
+    mock_fs.list_files.return_value = ["src/doc.md", "src/App.java", "src/image.png"]
+    mock_fs.relpath.side_effect = lambda path, _src: path.replace("src/", "")
+    mock_fs.is_binary_file.side_effect = AssertionError("text extensions should not be probed")
+
+    usecase = CorpusOptimizerUsecase(tok, mock_fs, hs, jc, builder)
+
+    inventory = usecase.build_file_inventory("src")
+
+    assert inventory.markdown_files == ["src/doc.md"]
+    assert inventory.java_files == ["src/App.java"]
+    assert inventory.binary_files == ["src/image.png"]
+
 
 def test_generate_report_formatting(tmp_path):
     fs = PhysicalFilesystem()

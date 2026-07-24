@@ -1,13 +1,16 @@
 import re
 from collections import Counter
-from typing import Any
+from typing import Any, Callable
 from cida.application.ports import TokenCounter, FileRepository, HashService, JsonCodec
 from cida.markdown.protected_regions import ProtectedRegionsManager
 from cida.markdown.dictionary import generate_alias_candidates, find_candidate_words, apply_dictionary
 from cida.domain.sidecar import create_sidecar_data
 
-validate_semantics: Any = None
-ParsedOriginalDocument: Any = None
+
+def _load_semantic_dependencies() -> tuple[type[Any], Callable[..., tuple[bool, str]]]:
+    from cida.markdown.semantic_equivalence import ParsedOriginalDocument, validate_semantics
+    return ParsedOriginalDocument, validate_semantics
+
 
 class FileOptimizerUsecase:
     """Orchestrates token minification and dictionary replacement for a single file."""
@@ -91,11 +94,15 @@ class FileOptimizerUsecase:
             return transformed_text, None, 0
 
         parsed_orig = None
+        ParsedOriginalDocument: type[Any] | None = None
+        validate_semantics: Callable[..., tuple[bool, str]] | None = None
+        if verify_semantics:
+            ParsedOriginalDocument, validate_semantics = _load_semantic_dependencies()
 
         words_to_eval = list(current_dict.items())
         working_dict = {}
 
-        for idx, (word, alias) in enumerate(words_to_eval):
+        for word, alias in words_to_eval:
             working_dict[word] = alias
             candidate_minified = apply_dictionary(transformed_text, working_dict, pm)
             entries_dict = {a: w for w, a in working_dict.items()}
@@ -128,14 +135,8 @@ class FileOptimizerUsecase:
                 continue
 
             if verify_semantics:
-                global ParsedOriginalDocument, validate_semantics
-                if validate_semantics is None or ParsedOriginalDocument is None:
-                    from cida.markdown.semantic_equivalence import (
-                        ParsedOriginalDocument as _ParsedOriginalDocument,
-                        validate_semantics as _validate_semantics,
-                    )
-                    validate_semantics = _validate_semantics
-                    ParsedOriginalDocument = _ParsedOriginalDocument
+                assert ParsedOriginalDocument is not None
+                assert validate_semantics is not None
                 if parsed_orig is None:
                     parsed_orig = ParsedOriginalDocument(content)
                 is_valid, _ = validate_semantics(content, candidate_minified, working_dict, parsed_original=parsed_orig)

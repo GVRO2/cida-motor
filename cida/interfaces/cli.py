@@ -14,19 +14,14 @@ from cida.infrastructure.tokenizer import OfflineTokenizer
 from cida.infrastructure.hashing import HashService
 from cida.infrastructure.json_codec import JsonCodec
 from cida.application.optimize_corpus import CorpusOptimizerUsecase
-from cida.application.strict_auditing import StrictBundleAuditor
 from cida.application.generate_report import ReportGeneratorUsecase
-from cida.domain.sidecar import create_compressed_envelope
 from cida.domain.processing_context import ProcessingContext
 from cida.markdown.protected_regions import ProtectedRegionsManager
-from cida.markdown.dictionary import apply_dictionary, CorpusDictionaryBuilder
 from cida.markdown.transforms import (
     remove_html_comments, trim_trailing_whitespace, normalize_newlines,
     table_whitespace, list_compaction, minificar_codigo_para_ia
 )
 
-validate_semantics: Any = None
-ParsedOriginalDocument: Any = None
 
 
 # ── Exit-code categories (severity order: 6 > 5 > 4 > 3 > 2 > 1) ────────────
@@ -115,6 +110,35 @@ def _build_processing_context(
         original_tokens=token_counter.count(source_text, content_hash=source_sha256),
         detected_profile=detected_profile,
     )
+
+
+def _accept_token_reducing_candidate(
+    current_text: str,
+    current_tokens: int,
+    candidate_text: str,
+    token_counter: Any,
+) -> tuple[str, int, bool]:
+    if candidate_text == current_text:
+        return current_text, current_tokens, False
+
+    candidate_tokens = token_counter.count(candidate_text)
+    if candidate_tokens < current_tokens:
+        return candidate_text, candidate_tokens, True
+    return current_text, current_tokens, False
+
+
+def _load_strict_bundle_auditor() -> Any:
+    from cida.application.strict_auditing import StrictBundleAuditor
+    return StrictBundleAuditor
+
+
+def _load_semantic_dependencies() -> tuple[type[Any], Any]:
+    from cida.markdown.semantic_equivalence import ParsedOriginalDocument, validate_semantics
+    return ParsedOriginalDocument, validate_semantics
+
+
+def _requires_identity_semantic_validation(content: str) -> bool:
+    return content.startswith("---")
 
 
 def counter_main():
@@ -283,15 +307,18 @@ def main():
         if args.profile == "auto" or args.dictionary_scope == "file":
             from cida.application.optimize_file import FileOptimizerUsecase
             file_opt = FileOptimizerUsecase(token_counter, file_repo, hash_service, json_codec)
-        if args.verify_semantics and args.profile in ("auto", "markdown", "bmad"):
-            global validate_semantics, ParsedOriginalDocument
-            from cida.markdown.semantic_equivalence import (
-                ParsedOriginalDocument as _ParsedOriginalDocument,
-                validate_semantics as _validate_semantics,
-            )
-            validate_semantics = _validate_semantics
-            ParsedOriginalDocument = _ParsedOriginalDocument
-        dictionary_builder = CorpusDictionaryBuilder()
+        semantic_dependencies: tuple[type[Any], Any] | None = None
+
+        def ensure_semantic_dependencies() -> tuple[type[Any], Any]:
+            nonlocal semantic_dependencies
+            if semantic_dependencies is None:
+                semantic_dependencies = _load_semantic_dependencies()
+            return semantic_dependencies
+
+        dictionary_builder = None
+        if args.dictionary_scope == "corpus":
+            from cida.markdown.dictionary import CorpusDictionaryBuilder
+            dictionary_builder = CorpusDictionaryBuilder()
         corpus_opt = CorpusOptimizerUsecase(token_counter, file_repo, hash_service, json_codec, dictionary_builder)
 
         inventory = corpus_opt.build_file_inventory(src_abs, java_processed_relpaths)
@@ -335,6 +362,7 @@ def main():
         content_cache: dict[str, ProcessingContext] = {}
 
         if args.dictionary_scope == "corpus":
+            from cida.markdown.dictionary import apply_dictionary
             corpus_dict, corpus_hash, sidecar_tokens_total, auxiliary_tokens = corpus_opt.build_corpus_dict(
                 files_to_process,
                 src_abs,
@@ -366,16 +394,19 @@ def main():
                         curr = normalize_newlines(curr)
                         curr = table_whitespace(curr)
                         curr = list_compaction(curr)
+                        if curr != c:
+                            curr_tokens = token_counter.count(curr)
                         pm = ProtectedRegionsManager()
                         cand = apply_dictionary(curr, corpus_dict, pm)
                         if cand != curr and args.verify_semantics:
+                            ParsedOriginalDocument, validate_semantics = ensure_semantic_dependencies()
                             parsed_c = ParsedOriginalDocument(c)
                             is_valid, _ = validate_semantics(c, cand, corpus_dict, parsed_original=parsed_c)
                             cand_tokens = token_counter.count(cand)
-                            if is_valid and cand_tokens < token_counter.count(curr):
+                            if is_valid and cand_tokens < curr_tokens:
                                 curr = cand
                                 curr_tokens = cand_tokens
-                        total_mini_tokens += curr_tokens if curr == c else token_counter.count(curr)
+                        total_mini_tokens += curr_tokens
                     else:
                         mini = minificar_codigo_para_ia(c, corpus_dict)
                         total_mini_tokens += token_counter.count(mini)
@@ -435,7 +466,8 @@ def main():
 
             content_sha = ctx.source_sha256
             orig_tokens = ctx.original_tokens
-            parsed_orig = ParsedOriginalDocument(content) if (args.verify_semantics and profile in ["markdown", "bmad"]) else None
+            parsed_orig = None
+            final_semantics_validated = False
 
             if profile in ["markdown", "bmad"]:
                 legacy = re.sub(r'^---\s*[\r\n]+.*?[\r\n]+---\s*[\r\n]+', '', content, flags=re.DOTALL)
@@ -481,21 +513,24 @@ def main():
                         rejected_transforms.append(f"{name}_no_gain")
                         continue
 
+                    candidate_tokens = token_counter.count(candidate_text)
+                    if candidate_tokens >= current_tokens:
+                        rejected_transforms.append(f"{name}_no_gain")
+                        continue
+
                     if args.verify_semantics:
+                        ParsedOriginalDocument, validate_semantics = ensure_semantic_dependencies()
+                        if parsed_orig is None:
+                            parsed_orig = ParsedOriginalDocument(content)
                         is_valid, _ = validate_semantics(content, candidate_text, parsed_original=parsed_orig)
                         if not is_valid:
                             rejected_transforms.append(f"{name}_semantic_fail")
                             continue
 
-                    cand_tokens = token_counter.count(candidate_text)
-                    curr_tokens = token_counter.count(current_text)
-
-                    if cand_tokens < curr_tokens:
-                        current_text = candidate_text
-                        current_tokens = cand_tokens
-                        accepted_transforms.append(name)
-                    else:
-                        rejected_transforms.append(f"{name}_no_gain")
+                    current_text = candidate_text
+                    current_tokens = candidate_tokens
+                    accepted_transforms.append(name)
+                    final_semantics_validated = args.verify_semantics
 
                 if args.dictionary_scope == "file":
                     candidate_text, sidecar_data, dict_tokens = file_opt.optimize_markdown_dictionary_file_scope(
@@ -516,6 +551,7 @@ def main():
                             tokens_aux = cand_aux_tokens
                             best_sidecar_data = sidecar_data
                             accepted_transforms.append("file_dictionary")
+                            final_semantics_validated = args.verify_semantics
                         else:
                             rejected_transforms.append("file_dictionary_no_gain")
                     else:
@@ -526,11 +562,13 @@ def main():
                     candidate_text = apply_dictionary(current_text, corpus_dict, pm)
 
                     if args.verify_semantics:
+                        ParsedOriginalDocument, validate_semantics = ensure_semantic_dependencies()
+                        if parsed_orig is None:
+                            parsed_orig = ParsedOriginalDocument(content)
                         is_valid, _ = validate_semantics(content, candidate_text, corpus_dict, parsed_original=parsed_orig)
                         if is_valid:
                             cand_tokens = token_counter.count(candidate_text)
-                            curr_tokens = token_counter.count(current_text)
-                            if cand_tokens < curr_tokens:
+                            if cand_tokens < current_tokens:
                                 cand_sidecar_tokens = int(sidecar_tokens_total * orig_tokens / total_orig_tokens) if total_orig_tokens > 0 else 0
                                 cand_aux_tokens = int(auxiliary_tokens * orig_tokens / total_orig_tokens) if total_orig_tokens > 0 else 0
 
@@ -543,6 +581,7 @@ def main():
                                     tokens_sidecar = cand_sidecar_tokens
                                     tokens_aux = cand_aux_tokens
                                     accepted_transforms.append("corpus_dictionary")
+                                    final_semantics_validated = args.verify_semantics
                                 else:
                                     rejected_transforms.append("corpus_dictionary_no_gain")
                             else:
@@ -551,7 +590,7 @@ def main():
                             rejected_transforms.append("corpus_dictionary_semantic_fail")
 
                 final_text = current_text
-                final_tokens = token_counter.count(final_text)
+                final_tokens = current_tokens
 
                 economia_bruta = orig_tokens - final_tokens
                 overhead = tokens_sidecar + tokens_aux
@@ -589,7 +628,15 @@ def main():
 
             exec_time = time.time() - start_time
 
-            if args.verify_semantics and profile in ["markdown", "bmad"]:
+            if (
+                args.verify_semantics
+                and profile in ["markdown", "bmad"]
+                and not final_semantics_validated
+                and (final_text != content or _requires_identity_semantic_validation(content))
+            ):
+                ParsedOriginalDocument, validate_semantics = ensure_semantic_dependencies()
+                if parsed_orig is None:
+                    parsed_orig = ParsedOriginalDocument(content)
                 validation_dict = {}
                 if dict_included:
                     if best_sidecar_data:
@@ -613,6 +660,7 @@ def main():
             text_to_write = final_text
             sidecar_path = None
             if dict_included and best_sidecar_data is not None:
+                from cida.domain.sidecar import create_compressed_envelope
                 sidecar_ref = file_repo.basename(dest_path) + ".cidatkn"
                 text_to_write = create_compressed_envelope(
                     payload=final_text,
@@ -662,6 +710,7 @@ def main():
             sys.exit(1)
 
         if not args.dry_run and validation_level == ValidationLevel.STRICT:
+            StrictBundleAuditor = _load_strict_bundle_auditor()
             strict_auditor = StrictBundleAuditor(file_repo, json_codec, hash_service)
             strict_auditor.audit_destination_sidecars(src_abs, dst_abs)
             for item in generated_bundles:

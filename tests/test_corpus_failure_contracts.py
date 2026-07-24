@@ -76,7 +76,6 @@ class TestCorpusHashFailure:
         file_repo = MagicMock()
         file_repo.is_binary_file.return_value = False
         file_repo.read_text.return_value = "# doc content for corpus building"
-        file_repo.read_bytes.side_effect = OSError("read error on bytes")
         file_repo.relpath.return_value = "doc.md"
 
         hash_service = MagicMock()
@@ -99,15 +98,16 @@ class TestCorpusHashFailure:
         file_repo.relpath.side_effect = lambda p, _: p.split("/")[-1]
 
         call_count = [0]
-        def read_bytes_side_effect(path):
+        def sha256_side_effect(_content):
             call_count[0] += 1
             if call_count[0] >= 1:
-                raise OSError("hash bytes error")
-            return b"content"
+                raise Exception("hash error")
+            return "0" * 64
 
-        file_repo.read_bytes.side_effect = read_bytes_side_effect
+        hash_service = MagicMock()
+        hash_service.sha256.side_effect = sha256_side_effect
 
-        uc = _make_usecase(file_repo=file_repo)
+        uc = _make_usecase(file_repo=file_repo, hash_service=hash_service)
         with pytest.raises(InternalProcessingError):
             uc.build_corpus_dict([fp1, fp2], str(tmp_path))
 

@@ -113,10 +113,10 @@ def test_balanced_does_not_construct_strict_auditor(tmp_path, monkeypatch):
         "--src", str(src_dir),
         "--dst", str(dst_dir),
         "--validation-level", "balanced",
-    ]), patch("cida.interfaces.cli.StrictBundleAuditor") as auditor_cls:
+    ]), patch("cida.interfaces.cli._load_strict_bundle_auditor") as load_auditor:
         cli_main()
 
-    auditor_cls.assert_not_called()
+    load_auditor.assert_not_called()
 
 
 def test_strict_constructs_auditor_once_and_audits_bundle_once(tmp_path, monkeypatch):
@@ -132,10 +132,12 @@ def test_strict_constructs_auditor_once_and_audits_bundle_once(tmp_path, monkeyp
         "--src", str(src_dir),
         "--dst", str(dst_dir),
         "--validation-level", "strict",
-    ]), patch("cida.interfaces.cli.StrictBundleAuditor") as auditor_cls:
+    ]), patch("cida.interfaces.cli._load_strict_bundle_auditor") as load_auditor:
+        auditor_cls = load_auditor.return_value
         auditor = auditor_cls.return_value
         cli_main()
 
+    load_auditor.assert_called_once()
     auditor_cls.assert_called_once()
     auditor.audit_destination_sidecars.assert_called_once()
     auditor.audit_output_bundle.assert_called_once()

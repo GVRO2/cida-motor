@@ -1,7 +1,8 @@
 import os
 import pytest
 from cida.markdown.dictionary import (
-    generate_alias_candidates, find_candidate_words, build_file_dictionary, build_corpus_dictionary, apply_dictionary
+    generate_alias_candidates, find_candidate_words, build_file_dictionary, build_corpus_dictionary,
+    apply_dictionary, _needs_protection
 )
 from cida.markdown.parser import parse_markdown
 from cida.markdown.semantic_equivalence import validate_semantics
@@ -55,6 +56,38 @@ def test_build_corpus_dictionary_gain():
     doc_single = "word_unique_test " * 2
     cdict_low = build_corpus_dictionary([doc_single], tok, min_margin=100)
     assert cdict_low == {}
+
+def test_corpus_dictionary_fast_path_detects_protected_region_hints():
+    protected_cases = [
+        "---\ntitle: repeated_word_value\n---\nbody",
+        "```python\nrepeated_word_value = 1\n```",
+        "~~~python\nrepeated_word_value = 1\n~~~",
+        "Use `repeated_word_value` here.",
+        "<!-- repeated_word_value -->",
+        "[label](docs/repeated_word_value.md)",
+        "Visit https://example.com/repeated_word_value",
+        "Use ${REPEATED_WORD_VALUE} now.",
+        "Open docs/repeated_word_value.md",
+        "stepsCompleted and workflowType are BMAD control fields.",
+        "This must not change.",
+    ]
+
+    for text in protected_cases:
+        assert _needs_protection(text), text
+
+
+def test_corpus_dictionary_fast_path_matches_full_parser_for_plain_markdown():
+    plain_cases = [
+        "simple repeated_word_value text repeated_word_value\n",
+        "- repeated_word_value item\n- another repeated_word_value item\n",
+        "| Name | Value |\n| --- | --- |\n| repeated_word_value | another_value |\n",
+        "# Header\n\nParagraph with repeated_word_value repeated_word_value.\n",
+    ]
+
+    for text in plain_cases:
+        assert not _needs_protection(text), text
+        full_manager = ProtectedRegionsManager()
+        assert find_candidate_words(text) == find_candidate_words(full_manager.protect(text))
 
 def test_parse_markdown_blocks():
     text_table = "| Col 1 | Col 2 |\n| --- | --- |\n| val 1 | val 2 |\n"

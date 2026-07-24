@@ -2,6 +2,21 @@ import re
 import string
 from collections import Counter
 
+_PROTECTED_HINT_RE = re.compile(
+    r"`|^([ \t]{0,3})~{3,}|^---[ \t]*(?:\r?\n|$)|\]\(|https?://|\{|\$\{|<|"
+    r"\b[\w.-]+/[\w.-]+(?:/[\w.-]+)*\b/?|"
+    r"stepsCompleted|workflowType|inputDocuments|nextStepFile|outputFile|"
+    r"bmad-|steps-[cev]|_bmad|[A-Za-z]:\\|"
+    r"[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\(\)|"
+    r"\b(?i:must|never|deve|nao|somente|obrigatorio)\b",
+    re.MULTILINE,
+)
+
+
+def _needs_protection(text):
+    return bool(_PROTECTED_HINT_RE.search(text))
+
+
 def generate_alias_candidates(exclude_set, limit=5000):
     """
     Generates a list of sorted, deterministic alias candidates (letters only)
@@ -126,8 +141,10 @@ def build_corpus_dictionary(all_files_content, token_counter, min_margin=5):
     word_counts = Counter()
     from cida.markdown.protected_regions import ProtectedRegionsManager
     for text in all_files_content:
-        pm = ProtectedRegionsManager()
-        protected = pm.protect(text)
+        protected = text
+        if _needs_protection(text):
+            pm = ProtectedRegionsManager()
+            protected = pm.protect(text)
         candidate_words = find_candidate_words(protected)
         word_counts.update(candidate_words)
 

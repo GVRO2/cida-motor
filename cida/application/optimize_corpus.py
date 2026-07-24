@@ -1,5 +1,6 @@
 from cida.application.ports import TokenCounter, FileRepository, HashService, JsonCodec, DictionaryBuilder
 from cida.domain.errors import SourcePathError, InternalProcessingError
+from cida.domain.policies import is_binary_extension
 from cida.domain.processing_context import FileInventory
 
 
@@ -33,7 +34,8 @@ class CorpusOptimizerUsecase:
             inventory.all_files.append(filepath)
             rel_p = self.file_repo.relpath(filepath, src_abs).lstrip('./') if src_is_dir else self.file_repo.basename(filepath)
             ext = "." + filepath.rsplit(".", 1)[1].lower() if "." in filepath else ""
-            is_binary = self.file_repo.is_binary_file(filepath)
+            is_supported = ext in supported_exts
+            is_binary = is_binary_extension(filepath) or (not is_supported and self.file_repo.is_binary_file(filepath))
 
             if is_binary:
                 inventory.binary_files.append(filepath)
@@ -56,10 +58,13 @@ class CorpusOptimizerUsecase:
 
     def build_corpus_dict(self, files: list, src_abs: str, skip_binary_check: bool = False) -> tuple:
         all_contents = []
+        text_by_path = {}
         for fp in files:
             if (skip_binary_check or not self.file_repo.is_binary_file(fp)) and (fp.endswith('.md') or fp.endswith('.txt')):
                 try:
-                    all_contents.append(self.file_repo.read_text(fp))
+                    content = self.file_repo.read_text(fp)
+                    text_by_path[fp] = content
+                    all_contents.append(content)
                 except Exception as exc:
                     raise SourcePathError(
                         f"Failed to read corpus source '{fp}': {exc}"
@@ -73,7 +78,7 @@ class CorpusOptimizerUsecase:
             if (skip_binary_check or not self.file_repo.is_binary_file(fp)) and (fp.endswith('.md') or fp.endswith('.txt')):
                 rel = self.file_repo.relpath(fp, src_abs).replace('\\', '/')
                 try:
-                    source_bytes = self.file_repo.read_bytes(fp)
+                    source_bytes = text_by_path[fp].encode('utf-8')
                     sha = self.hash_service.sha256(source_bytes)
                     manifest_files.append({"path": rel, "sha256": sha})
                 except Exception as exc:

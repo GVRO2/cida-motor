@@ -1,9 +1,9 @@
 import os
 import sys
 import pytest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from cida.domain.errors import TokenizerError
-from cida.interfaces.cli import counter_main, translate_main, main
+from cida.interfaces.cli import counter_main, translate_main, main, _accept_token_reducing_candidate
 
 @pytest.fixture(autouse=True)
 def setup_env():
@@ -32,6 +32,45 @@ def test_counter_main_generic_error():
          patch("sys.exit") as mock_exit:
         counter_main()
         mock_exit.assert_called_with(6)
+
+
+def test_accept_token_reducing_candidate_keeps_token_state_consistent():
+    token_counter = MagicCounter({"short": 1, "same tokens": 5})
+
+    text, tokens, accepted = _accept_token_reducing_candidate("current text", 3, "short", token_counter)
+
+    assert accepted is True
+    assert text == "short"
+    assert tokens == 1
+    assert token_counter.calls == ["short"]
+
+    text, tokens, accepted = _accept_token_reducing_candidate(text, tokens, "same tokens", token_counter)
+
+    assert accepted is False
+    assert text == "short"
+    assert tokens == 1
+    assert token_counter.calls == ["short", "same tokens"]
+
+
+def test_accept_token_reducing_candidate_rejects_identical_without_counting():
+    token_counter = MagicCounter({})
+
+    text, tokens, accepted = _accept_token_reducing_candidate("current text", 3, "current text", token_counter)
+
+    assert accepted is False
+    assert text == "current text"
+    assert tokens == 3
+    assert token_counter.calls == []
+
+
+class MagicCounter:
+    def __init__(self, counts):
+        self.counts = counts
+        self.calls = []
+
+    def count(self, text):
+        self.calls.append(text)
+        return self.counts[text]
 
 def test_translate_main_no_args():
     with patch.object(sys, "argv", ["translate.py"]), \
@@ -219,6 +258,33 @@ def test_cli_main_file_dictionary(tmp_path):
     ]
     with patch.object(sys, "argv", test_args):
         main()
+
+
+def test_cli_main_does_not_repeat_final_semantic_validation(tmp_path):
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    dst.mkdir()
+    (src / "doc.md").write_text("# Title\n\nVisible <!-- removable comment --> text", encoding="utf-8")
+
+    validator = MagicMock(return_value=(True, "ok"))
+
+    class Parsed:
+        def __init__(self, _content):
+            pass
+
+    test_args = [
+        "cida", "--src", str(src), "--dst", str(dst),
+        "--mode", "semantic", "--profile", "markdown",
+        "--dictionary-scope", "none"
+    ]
+    with patch.object(sys, "argv", test_args), \
+         patch("cida.interfaces.cli._load_semantic_dependencies") as load_deps:
+        load_deps.return_value = (Parsed, validator)
+        main()
+
+    assert validator.call_count == 1
+
 
 def test_cli_main_continue_on_error(tmp_path):
     src = tmp_path / "src"
