@@ -76,6 +76,12 @@ def test_physical_filesystem_operations(tmp_path):
     with pytest.raises(EncodingValidationError):
         fs.read_text(invalid_utf8)
 
-    # Report path safety check
+    # Report path safety check — report_path is a stem (no extension).
+    # validate_filesystem_safety checks report_path+'.md' and report_path+'.json'.
+    # Create a .md source file and a report_path that when suffixed with '.md'
+    # collides with that source file.
+    md_file = str(tmp_path / "report")
+    with open(md_file + ".md", "w", encoding="utf-8") as f:
+        f.write("source content")
     with pytest.raises(SourcePathError):
-        validate_filesystem_safety(txt_file, str(tmp_path / "dst"), report_path=txt_file)
+        validate_filesystem_safety(md_file + ".md", str(tmp_path / "dst"), report_path=md_file)

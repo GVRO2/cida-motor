@@ -76,7 +76,7 @@ def main():
 
         # 3. Execution - RUN 1
         print("Running minifier: Run 1...")
-        cmd_1 = [go_cli, fixtures_dir, output_dir_1, "--profile", "auto", "--dictionary-scope", "file"]
+        cmd_1 = [go_cli, fixtures_dir, output_dir_1, "--mode", "semantic", "--profile", "auto", "--dictionary-scope", "file"]
         res_1 = subprocess.run(cmd_1, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
         if res_1.returncode != 0:
             sys.stderr.buffer.write(f"Run 1 failed:\n{res_1.stderr}\n".encode("utf-8"))
@@ -84,7 +84,7 @@ def main():
 
         # 4. Execution - RUN 2
         print("Running minifier: Run 2...")
-        cmd_2 = [go_cli, fixtures_dir, output_dir_2, "--profile", "auto", "--dictionary-scope", "file"]
+        cmd_2 = [go_cli, fixtures_dir, output_dir_2, "--mode", "semantic", "--profile", "auto", "--dictionary-scope", "file"]
         res_2 = subprocess.run(cmd_2, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
         if res_2.returncode != 0:
             sys.stderr.buffer.write(f"Run 2 failed:\n{res_2.stderr}\n".encode("utf-8"))

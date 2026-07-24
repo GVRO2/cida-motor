@@ -56,6 +56,43 @@ def test_translate_main_with_valid_sidecar(tmp_path):
         translate_main()
         mock_print.assert_called_with({"AA": "hello", "BB": "Não encontrado"})
 
+def test_translate_main_with_source_sidecar(tmp_path):
+    source = tmp_path / "doc.md"
+    source.write_text("# Source", encoding="utf-8")
+    sidecar_file = tmp_path / "doc.md.cidatkn"
+    sidecar_file.write_text('{"entries": {"AA": "hello"}}', encoding="utf-8")
+
+    with patch.object(sys, "argv", ["translate.py", "AA", "--source", str(source)]), \
+         patch("builtins.print") as mock_print:
+        translate_main()
+
+    mock_print.assert_called_with({"AA": "hello"})
+
+
+def test_translate_main_missing_source_sidecar(tmp_path):
+    source = tmp_path / "doc.md"
+    source.write_text("# Source", encoding="utf-8")
+
+    with patch.object(sys, "argv", ["translate.py", "AA", "--source", str(source)]), \
+         pytest.raises(SystemExit) as exc:
+        translate_main()
+
+    assert exc.value.code == 5
+
+
+def test_translate_main_alias_collision_requires_explicit_sidecar(tmp_path):
+    sidecar_dir = tmp_path / "sidecar"
+    sidecar_dir.mkdir()
+    (sidecar_dir / "a.cidatkn").write_text('{"entries": {"AA": "hello"}}', encoding="utf-8")
+    (sidecar_dir / "b.cidatkn").write_text('{"entries": {"AA": "world"}}', encoding="utf-8")
+
+    with patch.object(sys, "argv", ["translate.py", "AA", "--path", str(sidecar_dir)]), \
+         pytest.raises(SystemExit) as exc:
+        translate_main()
+
+    assert exc.value.code == 1
+
+
 def test_translate_main_corrupted_sidecar(tmp_path):
     sidecar_dir = tmp_path / "sidecar"
     sidecar_dir.mkdir()
@@ -97,6 +134,36 @@ def test_cli_main_java_raw_json(tmp_path):
     ]
     with patch.object(sys, "argv", test_args):
         main()
+
+def test_cli_main_corrupt_java_raw_json_warns_then_fails_empty_source(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    dst = tmp_path / "dst"
+    java_json = tmp_path / "bad_java_metrics.json"
+    java_json.write_text("{not-json", encoding="utf-8")
+
+    test_args = [
+        "cida", "--src", str(src), "--dst", str(dst),
+        "--java-raw-json", str(java_json), "--dry-run"
+    ]
+    with patch.object(sys, "argv", test_args), \
+         pytest.raises(SystemExit) as exc:
+        main()
+
+    assert exc.value.code == 4
+
+
+def test_cli_main_empty_source_dir_exits_source_error(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    dst = tmp_path / "dst"
+
+    with patch.object(sys, "argv", ["cida", "--src", str(src), "--dst", str(dst)]), \
+         pytest.raises(SystemExit) as exc:
+        main()
+
+    assert exc.value.code == 4
+
 
 def test_cli_main_corpus_scope(tmp_path):
     src = tmp_path / "src"

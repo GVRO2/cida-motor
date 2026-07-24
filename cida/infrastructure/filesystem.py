@@ -34,6 +34,8 @@ class PhysicalFilesystem:
                 if durable or self.durable:
                     os.fsync(f.fileno())
             os.replace(tmp_path, abs_path)
+            if durable or self.durable:
+                _sync_directory(dir_name)
         except Exception:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
@@ -51,6 +53,8 @@ class PhysicalFilesystem:
                 if durable or self.durable:
                     os.fsync(f.fileno())
             os.replace(tmp_path, abs_path)
+            if durable or self.durable:
+                _sync_directory(dir_name)
         except Exception:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
@@ -85,8 +89,9 @@ class PhysicalFilesystem:
                 chunk = f.read(1024)
                 if b'\0' in chunk:
                     return True
-        except Exception:
-            pass
+        except OSError:
+            # Cannot read file — assume non-binary (caller handles read errors)
+            return False
         return False
 
     def list_files(self, dir_path: str) -> List[str]:
@@ -117,6 +122,24 @@ class PhysicalFilesystem:
         return os.listdir(path)
 
 
+def _sync_directory(dir_path: str) -> None:
+    """Sync directory entry on platforms that support O_DIRECTORY (POSIX).
+    On Windows, this is a no-op since Windows does not require directory fsync
+    and does not expose O_DIRECTORY in the standard library.
+    """
+    if not hasattr(os, 'O_DIRECTORY'):
+        return
+    try:
+        dir_fd = os.open(dir_path, os.O_DIRECTORY)  # type: ignore[attr-defined]
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        # Best-effort — directory sync is advisory; do not fail the write.
+        pass
+
+
 def validate_filesystem_safety(source: str, destination: str, report_path: str = "") -> None:
     from cida.domain.errors import SourcePathError
 
@@ -138,12 +161,34 @@ def validate_filesystem_safety(source: str, destination: str, report_path: str =
         raise SourcePathError(f"Source directory cannot be inside destination directory: {src_abs} inside {dst_abs}")
 
     if report_path:
-        rep_abs = os.path.normcase(os.path.realpath(os.path.abspath(report_path)))
-        if rep_abs == src_abs:
-            raise SourcePathError(f"Report path cannot overwrite source input: {rep_abs}")
-        try:
-            if os.path.commonpath([src_abs, rep_abs]) == src_abs and os.path.isfile(src_abs):
-                raise SourcePathError(f"Report path cannot overwrite source file: {rep_abs}")
-        except ValueError:
-            pass
+        source_is_file = os.path.isfile(src_abs)
+        output_collision_paths = set()
+        if source_is_file:
+            output_base = os.path.normcase(os.path.realpath(os.path.join(dst_abs, os.path.basename(src_abs))))
+            output_collision_paths.update({
+                output_base,
+                output_base + ".tknc",
+                output_base + ".cidatkn",
+                output_base + ".tknc.cidatkn",
+            })
+
+        # Validate both final resolved output paths, not just the bare stem.
+        for suffix in (".md", ".json"):
+            candidate = report_path + suffix
+            rep_abs = os.path.normcase(os.path.realpath(os.path.abspath(candidate)))
+            if rep_abs == src_abs:
+                raise SourcePathError(
+                    f"Report path '{candidate}' cannot overwrite source input: {src_abs}"
+                )
+            try:
+                if os.path.commonpath([src_abs, rep_abs]) == src_abs and os.path.isfile(src_abs):
+                    raise SourcePathError(
+                        f"Report path '{candidate}' cannot overwrite source file: {src_abs}"
+                    )
+            except ValueError:
+                pass
+            if rep_abs in output_collision_paths:
+                raise SourcePathError(
+                    f"Report path '{candidate}' cannot overwrite generated output or sidecar: {rep_abs}"
+                )
 

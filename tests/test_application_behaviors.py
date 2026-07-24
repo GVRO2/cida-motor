@@ -63,6 +63,7 @@ def test_optimize_file_scope_sidecar_exception_branch():
         assert res_text == text
 
 def test_optimize_corpus_empty_and_exception_branches(tmp_path):
+    from cida.domain.errors import SourcePathError
     fs = PhysicalFilesystem()
     tok = OfflineTokenizer(cache_dir="resources")
     hs = HashService()
@@ -82,8 +83,12 @@ def test_optimize_corpus_empty_and_exception_branches(tmp_path):
     mock_fs.read_text.side_effect = Exception("read fail")
     mock_fs.read_bytes.side_effect = Exception("read fail")
     usecase_err = CorpusOptimizerUsecase(tok, mock_fs, hs, jc, builder)
-    res_err = usecase_err.build_corpus_dict(["f1.md"], str(tmp_path))
-    assert res_err == ({}, "", 0, 0)
+    # Read failures now propagate as SourcePathError (exit_code=4)
+    # rather than being silently swallowed.
+    with pytest.raises(SourcePathError) as exc_info:
+        usecase_err.build_corpus_dict(["f1.md"], str(tmp_path))
+    assert exc_info.value.exit_code == 4
+    assert "f1.md" in str(exc_info.value)
 
 def test_generate_report_formatting(tmp_path):
     fs = PhysicalFilesystem()

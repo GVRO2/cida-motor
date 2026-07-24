@@ -331,9 +331,16 @@ func main() {
 				containsJavaOrCode = true
 			}
 		} else {
-			absOrig, _ := filepath.Abs(pastaOrig)
-			filepath.WalkDir(absOrig, func(path string, d os.DirEntry, err error) error {
-				if err != nil || d.IsDir() {
+			absOrig, absErr := filepath.Abs(pastaOrig)
+			if absErr != nil {
+				fmt.Fprintf(os.Stderr, "❌ Erro ao resolver caminho para pré-scan: %v\n", absErr)
+				os.Exit(4)
+			}
+			if walkErr := filepath.WalkDir(absOrig, func(path string, d os.DirEntry, err error) error {
+				if err != nil {
+					return fmt.Errorf("failed to traverse %s during pre-scan: %w", path, err)
+				}
+				if d.IsDir() {
 					return nil
 				}
 				if isBinaryFileGo(path) {
@@ -345,7 +352,10 @@ func main() {
 					return filepath.SkipAll
 				}
 				return nil
-			})
+			}); walkErr != nil {
+				fmt.Fprintf(os.Stderr, "❌ Erro durante pré-scan de diretório: %v\n", walkErr)
+				os.Exit(4)
+			}
 		}
 		if containsJavaOrCode {
 			effectiveProfile = "code"
@@ -381,22 +391,38 @@ func main() {
 		var lastModTimes = make(map[string]time.Time)
 		for {
 			changed := false
-			filepath.WalkDir(pastaOrig, func(path string, d os.DirEntry, err error) error {
-				if err != nil { return nil }
-				absPath, _ := filepath.Abs(path)
-				absComp, _ := filepath.Abs(pastaComp)
-				if d.IsDir() && strings.HasPrefix(absPath, absComp) {
+			absOrigW, absOrigErr := filepath.Abs(pastaOrig)
+			absCompW, absCompErr := filepath.Abs(pastaComp)
+			if absOrigErr != nil || absCompErr != nil {
+				fmt.Fprintf(os.Stderr, "❌ Erro ao resolver caminhos no watcher: orig=%v dest=%v\n", absOrigErr, absCompErr)
+				os.Exit(4)
+			}
+			if walkErr := filepath.WalkDir(absOrigW, func(path string, d os.DirEntry, err error) error {
+				if err != nil {
+					return fmt.Errorf("failed to traverse %s in watcher: %w", path, err)
+				}
+				absPath, absErr := filepath.Abs(path)
+				if absErr != nil {
+					return fmt.Errorf("failed to resolve path %s in watcher: %w", path, absErr)
+				}
+				if d.IsDir() && strings.HasPrefix(absPath, absCompW) {
 					return filepath.SkipDir
 				}
 				if !d.IsDir() {
-					info, _ := d.Info()
+					info, infoErr := d.Info()
+					if infoErr != nil {
+						return fmt.Errorf("failed to stat %s in watcher: %w", path, infoErr)
+					}
 					if t, ok := lastModTimes[path]; !ok || info.ModTime().After(t) {
 						lastModTimes[path] = info.ModTime()
 						changed = true
 					}
 				}
 				return nil
-			})
+			}); walkErr != nil {
+				fmt.Fprintf(os.Stderr, "❌ Erro durante varredura no watcher: %v\n", walkErr)
+				os.Exit(4)
+			}
 
 			if changed {
 				fmt.Println("🔄 Alteração detectada, recompilando...")
@@ -448,10 +474,19 @@ func writeAtomic(targetPath string, data []byte, durable bool) error {
 	if err := tmpFile.Close(); err != nil {
 		return err
 	}
+	cleanup = false
 	if err := os.Rename(tmpName, targetPath); err != nil {
+		cleanup = true
 		return err
 	}
-	cleanup = false
+	if durable {
+		// Sync the parent directory so the rename is durable (POSIX best-practice).
+		// On Windows, os.File.Sync on a directory is a no-op; attempt anyway.
+		if d, err := os.Open(dir); err == nil {
+			_ = d.Sync() // best-effort
+			d.Close()
+		}
+	}
 	return nil
 }
 
@@ -467,8 +502,16 @@ type JavaRawMetric struct {
 }
 
 func processarEComparar(pastaOrig string, pastaComp string, mode string, profile string, dictScope string, failOnInflation bool, reportFormat string, reportPath string, verifySemantics bool, dryRun bool, continueOnError bool, noCache bool, durableWrites bool) {
-	absOrig, _ := filepath.Abs(pastaOrig)
-	absComp, _ := filepath.Abs(pastaComp)
+	absOrig, err := filepath.Abs(pastaOrig)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Erro ao resolver caminho de origem: %v\n", err)
+		os.Exit(4)
+	}
+	absComp, err := filepath.Abs(pastaComp)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Erro ao resolver caminho de destino: %v\n", err)
+		os.Exit(4)
+	}
 
 	if absOrig == absComp {
 		fmt.Printf("❌ Erro: Destino não pode ser igual à origem: %s\n", absOrig)
@@ -486,7 +529,10 @@ func processarEComparar(pastaOrig string, pastaComp string, mode string, profile
 	}
 	if _, err := os.Stat(absComp); (os.IsNotExist(err) || dirIsEmpty) && !dryRun {
 		fmt.Printf("📂 Criando pasta de destino: %s\n", absComp)
-		os.MkdirAll(absComp, 0755)
+		if err := os.MkdirAll(absComp, 0755); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Erro ao criar diretório de destino: %v\n", err)
+			os.Exit(4)
+		}
 		criarReadmeMinificado(absComp, absOrig, durableWrites)
 	}
 
@@ -495,20 +541,25 @@ func processarEComparar(pastaOrig string, pastaComp string, mode string, profile
 	var mdFiles []string
 	var binaryFiles []string
 
-	filepath.WalkDir(absOrig, func(path string, d os.DirEntry, err error) error {
-		if err != nil { return nil }
-		absPath, _ := filepath.Abs(path)
-		
+	if err := filepath.WalkDir(absOrig, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return fmt.Errorf("failed to traverse %s: %w", path, err)
+		}
+		absPath, err := filepath.Abs(path)
+		if err != nil {
+			return fmt.Errorf("failed to resolve absolute path for %s: %w", path, err)
+		}
+
 		// Avoid going into destination folder
 		if d.IsDir() && strings.HasPrefix(absPath, absComp) {
 			return filepath.SkipDir
 		}
-		
+
 		if !d.IsDir() {
 			if strings.Contains(absPath, "_mimificado") || strings.Contains(absPath, "tknd") {
 				return nil
 			}
-			
+
 			if isBinaryFileGo(absPath) {
 				binaryFiles = append(binaryFiles, absPath)
 			} else if strings.HasSuffix(strings.ToLower(absPath), ".java") {
@@ -522,7 +573,10 @@ func processarEComparar(pastaOrig string, pastaComp string, mode string, profile
 			}
 		}
 		return nil
-	})
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Erro durante varredura de arquivos: %v\n", err)
+		os.Exit(4)
+	}
 
 	// 2. Process Java files natively in Go
 	var javaMetrics []JavaRawMetric
@@ -554,12 +608,17 @@ func processarEComparar(pastaOrig string, pastaComp string, mode string, profile
 		var miniTokensTotal int = 0
 		
 		for _, fp := range javaFiles {
-			relPath, _ := filepath.Rel(absOrig, fp)
+			relPath, err := filepath.Rel(absOrig, fp)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Erro ao calcular caminho relativo para %s: %v\n", fp, err)
+				os.Exit(4)
+			}
 			destPath := filepath.Join(absComp, relPath) + ".tknc"
-			
+
 			contentBytes, err := os.ReadFile(fp)
 			if err != nil {
-				continue
+				fmt.Fprintf(os.Stderr, "❌ Erro ao ler arquivo Java %s: %v\n", fp, err)
+				os.Exit(4)
 			}
 			contentStr := string(contentBytes)
 			origTok, err := estimarTokens(contentStr)
@@ -694,17 +753,25 @@ func processarEComparar(pastaOrig string, pastaComp string, mode string, profile
 		
 		if len(javaMetrics) > 0 {
 			javaMetricsJson, err := json.Marshal(javaMetrics)
-			if err == nil {
-				if dryRun {
-					tempDir, err := os.MkdirTemp("", "cida_dryrun_*")
-					if err == nil {
-						tempJavaJsonPath = filepath.Join(tempDir, ".cida_java_raw.json")
-						writeAtomic(tempJavaJsonPath, javaMetricsJson, durableWrites)
-						defer os.RemoveAll(tempDir)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Erro ao serializar métricas Java: %v\n", err)
+				os.Exit(6)
+			}
+			if dryRun {
+				tempDir, err := os.MkdirTemp("", "cida_dryrun_*")
+				if err == nil {
+					tempJavaJsonPath = filepath.Join(tempDir, ".cida_java_raw.json")
+					if err := writeAtomic(tempJavaJsonPath, javaMetricsJson, durableWrites); err != nil {
+						fmt.Fprintf(os.Stderr, "❌ Erro ao escrever JSON temporário Java (dry-run): %v\n", err)
+						os.Exit(4)
 					}
-				} else {
-					tempJavaJsonPath = filepath.Join(absComp, ".cida_java_raw.json")
-					writeAtomic(tempJavaJsonPath, javaMetricsJson, durableWrites)
+					defer os.RemoveAll(tempDir)
+				}
+			} else {
+				tempJavaJsonPath = filepath.Join(absComp, ".cida_java_raw.json")
+				if err := writeAtomic(tempJavaJsonPath, javaMetricsJson, durableWrites); err != nil {
+					fmt.Fprintf(os.Stderr, "❌ Erro ao escrever JSON temporário Java: %v\n", err)
+					os.Exit(4)
 				}
 			}
 		}
@@ -801,11 +868,19 @@ Este diretório contém uma versão otimizada (minificada) do seu código, gerad
 - Ferramenta de Tradução (translate.py): Caso seja estritamente necessário entender um identificador, utilize o script 'translate.py' na raiz do projeto original. *AVISO: Use esta ferramenta apenas quando necessário e armazene a tradução em seu contexto imediato para evitar chamadas redundantes.*
 - Edição: As sugestões de código devem ser baseadas na estrutura da pasta original.
 `
-	
-	writeAtomic(filepath.Join(pastaDestino, "README_MINIFICADO.md"), []byte(conteudo), durable)
-	writeAtomic(filepath.Join(pastaDestino, "CONSTITUTION.md"), []byte(getConstitutionContent()), durable)
-	writeAtomic(filepath.Join(pastaDestino, "AGENTS.md"), []byte(getAgentsContent()), durable)
-	writeAtomic(filepath.Join(pastaDestino, "PROMPT_INICIAL.MD"), []byte(getPromptInicialContent()), durable)
+
+	for _, pair := range []struct{ name, content string }{
+		{"README_MINIFICADO.md", conteudo},
+		{"CONSTITUTION.md", getConstitutionContent()},
+		{"AGENTS.md", getAgentsContent()},
+		{"PROMPT_INICIAL.MD", getPromptInicialContent()},
+	} {
+		target := filepath.Join(pastaDestino, pair.name)
+		if err := writeAtomic(target, []byte(pair.content), durable); err != nil {
+			fmt.Fprintf(os.Stderr, "❌ Erro ao escrever %s: %v\n", target, err)
+			os.Exit(4)
+		}
+	}
 }
 
 func criarReadmeTknd(pastaTknd string, durable bool) {
@@ -824,7 +899,11 @@ Sempre que encontrar um identificador ofuscado (ex: A5), procure no arquivo corr
 Para facilitar a tradução automática, utilize o script 'translate.py' disponível na raiz do projeto original passando os tokens como argumento.
 Exemplo: python3 translate.py A0 B1
 `
-	writeAtomic(filepath.Join(pastaTknd, "README.md"), []byte(conteudo), durable)
+	target := filepath.Join(pastaTknd, "README.md")
+	if err := writeAtomic(target, []byte(conteudo), durable); err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Erro ao escrever README do tknd: %v\n", err)
+		os.Exit(4)
+	}
 }
 
 func getPromptInicialContent() string {
@@ -977,7 +1056,11 @@ if __name__ == "__main__":
 
 func gerarScriptTraducao(pastaDestino string, durable bool) {
 	conteudo := getTranslatePyContent()
-	writeAtomic(filepath.Join(pastaDestino, "translate.py"), []byte(conteudo), durable)
+	target := filepath.Join(pastaDestino, "translate.py")
+	if err := writeAtomic(target, []byte(conteudo), durable); err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Erro ao escrever script de tradução: %v\n", err)
+		os.Exit(4)
+	}
 }
 
 func construirDicionario(pastaOrig string, javaFiles []string, corpusHash string) (map[string]string, map[string]SidecarData) {
@@ -987,7 +1070,8 @@ func construirDicionario(pastaOrig string, javaFiles []string, corpusHash string
 	for _, path := range javaFiles {
 		conteudo, err := os.ReadFile(path)
 		if err != nil {
-			continue
+			fmt.Fprintf(os.Stderr, "❌ Erro ao ler arquivo Java em construirDicionário %s: %v\n", path, err)
+			os.Exit(4)
 		}
 		palavras := rePalavras.FindAllString(string(conteudo), -1)
 		for _, p := range palavras {
