@@ -8,7 +8,6 @@ Validates realpath/normcase/commonpath containment enforcement:
 - bundle output/sidecar/source symlink outside root
 """
 import os
-import sys
 import json
 import pytest
 from unittest.mock import MagicMock
@@ -87,8 +86,7 @@ class TestValidateSidecarRefPhysical:
         with pytest.raises(SidecarValidationError):
             validate_sidecar_ref_physical(str(compressed), "/etc/sidecar.cidatkn", str(output_root))
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks require elevation on Windows")
-    def test_rejects_symlink_escaping_root(self, tmp_path):
+    def test_rejects_symlink_escaping_root(self, tmp_path, monkeypatch):
         output_root = tmp_path / "output"
         output_root.mkdir()
         outside = tmp_path / "outside"
@@ -96,12 +94,20 @@ class TestValidateSidecarRefPhysical:
         outside_file = outside / "secret.cidatkn"
         outside_file.write_bytes(b"{}")
 
-        # Create symlink inside output_root pointing outside
-        link = output_root / "evil.cidatkn"
-        link.symlink_to(outside_file)
-
         compressed = output_root / "doc.md"
         compressed.write_bytes(b"content")
+        evil_candidate = os.path.join(
+            os.path.normcase(os.path.realpath(os.path.dirname(os.path.abspath(str(compressed))))),
+            "evil.cidatkn",
+        )
+        original_realpath = os.path.realpath
+
+        def fake_realpath(path):
+            if os.path.normcase(path) == os.path.normcase(evil_candidate):
+                return original_realpath(str(outside_file))
+            return original_realpath(path)
+
+        monkeypatch.setattr(os.path, "realpath", fake_realpath)
 
         with pytest.raises(SidecarValidationError) as exc_info:
             validate_sidecar_ref_physical(str(compressed), "evil.cidatkn", str(output_root))
@@ -198,8 +204,7 @@ class TestReconcileEnvelopeAndSidecar:
 
         assert exc_info.value.exit_code == 5
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks require elevation on Windows")
-    def test_symlink_sidecar_pointing_outside_fails(self, tmp_path):
+    def test_symlink_sidecar_pointing_outside_fails(self, tmp_path, monkeypatch):
         """Sidecar file that is a symlink pointing outside the root fails."""
         output_dir = tmp_path / "output"
         output_dir.mkdir()
@@ -211,19 +216,29 @@ class TestReconcileEnvelopeAndSidecar:
         compressed = output_dir / "doc.md"
         compressed.write_bytes(b"compressed")
 
-        # Create symlink in output pointing to outside
-        link = output_dir / "doc.md.cidatkn"
-        link.symlink_to(outside_sidecar)
+        sidecar = output_dir / "doc.md.cidatkn"
+        sidecar.write_bytes(b"{}")
 
         envelope = self._make_envelope(sidecar_ref="doc.md.cidatkn")
         sidecar_data = self._make_sidecar()
+        parent_real = os.path.normcase(os.path.realpath(os.path.dirname(os.path.abspath(str(compressed)))))
+        resolved_declared = os.path.normcase(os.path.realpath(os.path.join(parent_real, envelope["sidecar_ref"])))
+        original_realpath = os.path.realpath
+
+        def fake_realpath(path):
+            if os.path.normcase(path) == os.path.normcase(resolved_declared):
+                return original_realpath(str(outside_sidecar))
+            return original_realpath(path)
+
+        monkeypatch.setattr(os.path, "realpath", fake_realpath)
 
         with pytest.raises(SidecarValidationError):
             reconcile_envelope_and_sidecar(
                 envelope,
                 sidecar_data,
-                actual_sidecar_filename=str(link),
-                compressed_file=str(compressed),
+                actual_sidecar_filename=str(sidecar),
+                resolved_declared_ref=resolved_declared,
+                resolved_actual_sidecar=os.path.normcase(os.path.realpath(os.path.abspath(str(sidecar)))),
             )
 
 

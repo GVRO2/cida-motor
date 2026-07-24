@@ -55,12 +55,14 @@ class TestDurableDirectorySync:
         else:
             pytest.skip("Windows-specific test")
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="O_DIRECTORY not on Windows")
-    def test_sync_directory_calls_fsync_on_posix(self, tmp_path):
-        """On POSIX, _sync_directory calls os.fsync with an O_DIRECTORY fd."""
-        with patch("os.fsync") as mock_fsync:
+    def test_sync_directory_calls_fsync_when_directory_handles_are_supported(self, tmp_path, monkeypatch):
+        """When O_DIRECTORY is available, _sync_directory fsyncs the directory fd."""
+        monkeypatch.setattr(os, "O_DIRECTORY", 0, raising=False)
+        with patch("os.open", return_value=123), \
+             patch("os.fsync") as mock_fsync, \
+             patch("os.close"):
             _sync_directory(str(tmp_path))
-            mock_fsync.assert_called_once()
+            mock_fsync.assert_called_once_with(123)
 
     def test_sync_directory_best_effort_success_path(self, tmp_path, monkeypatch):
         monkeypatch.setattr(os, "O_DIRECTORY", 0, raising=False)

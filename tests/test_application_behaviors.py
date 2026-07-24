@@ -90,6 +90,35 @@ def test_optimize_corpus_empty_and_exception_branches(tmp_path):
     assert exc_info.value.exit_code == 4
     assert "f1.md" in str(exc_info.value)
 
+
+def test_optimize_corpus_builds_single_file_inventory(tmp_path):
+    fs = PhysicalFilesystem()
+    tok = OfflineTokenizer(cache_dir="resources")
+    hs = HashService()
+    jc = JsonCodec()
+    builder = MagicMock()
+    usecase = CorpusOptimizerUsecase(tok, fs, hs, jc, builder)
+
+    (tmp_path / "doc.md").write_text("# doc", encoding="utf-8")
+    (tmp_path / "App.java").write_text("class App {}", encoding="utf-8")
+    (tmp_path / "script.py").write_text("print(1)", encoding="utf-8")
+    (tmp_path / "image.png").write_bytes(b"\x89PNG\x00")
+    tknd = tmp_path / "tknd"
+    tknd.mkdir()
+    (tknd / "ignored.md").write_text("# generated", encoding="utf-8")
+
+    inventory = usecase.build_file_inventory(str(tmp_path), {"App.java"})
+
+    assert len(inventory.all_files) == 5
+    assert str(tmp_path / "doc.md") in inventory.markdown_files
+    assert str(tmp_path / "App.java") in inventory.java_files
+    assert str(tmp_path / "script.py") in inventory.code_files
+    assert str(tmp_path / "image.png") in inventory.binary_files
+    assert str(tmp_path / "doc.md") in inventory.processable_files
+    assert str(tmp_path / "script.py") in inventory.processable_files
+    assert str(tmp_path / "App.java") not in inventory.processable_files
+    assert str(tknd / "ignored.md") not in inventory.processable_files
+
 def test_generate_report_formatting(tmp_path):
     fs = PhysicalFilesystem()
     jc = JsonCodec()

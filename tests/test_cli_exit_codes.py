@@ -159,8 +159,9 @@ class TestCLIExitCodes(unittest.TestCase):
         with open(os.path.join(dst, "tknd/A0.cidatkn"), "w", encoding="utf-8") as f:
             f.write("{invalid json")
 
-        res = self.run_cli([src, dst, "--profile", "markdown"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        res = self.run_cli([src, dst, "--profile", "markdown", "--validation-level", "strict"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(res.returncode, 5)
+
 
     def test_exit_code_6_internal_error(self):
         # Clear PATH to prevent Go CLI from starting Python
