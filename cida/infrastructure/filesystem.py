@@ -8,6 +8,7 @@ class PhysicalFilesystem:
 
     def __init__(self, durable: bool = False):
         self.durable = durable
+        self._created_dirs: set[str] = set()
 
     def read_text(self, filepath: str, encoding: str = "utf-8") -> str:
         try:
@@ -24,7 +25,9 @@ class PhysicalFilesystem:
     def write_text(self, filepath: str, content: str, encoding: str = "utf-8", durable: bool = False) -> None:
         abs_path = os.path.abspath(filepath)
         dir_name = os.path.dirname(abs_path)
-        os.makedirs(dir_name, exist_ok=True)
+        if dir_name not in self._created_dirs:
+            os.makedirs(dir_name, exist_ok=True)
+            self._created_dirs.add(dir_name)
         content_lf = content.replace('\r\n', '\n')
         fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix=".tmp-")
         try:
@@ -44,7 +47,9 @@ class PhysicalFilesystem:
     def write_bytes(self, filepath: str, content: bytes, durable: bool = False) -> None:
         abs_path = os.path.abspath(filepath)
         dir_name = os.path.dirname(abs_path)
-        os.makedirs(dir_name, exist_ok=True)
+        if dir_name not in self._created_dirs:
+            os.makedirs(dir_name, exist_ok=True)
+            self._created_dirs.add(dir_name)
         fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix=".tmp-")
         try:
             with os.fdopen(fd, 'wb') as f:
@@ -70,7 +75,10 @@ class PhysicalFilesystem:
         return os.path.isdir(path)
 
     def makedirs(self, path: str) -> None:
-        os.makedirs(path, exist_ok=True)
+        abs_path = os.path.abspath(path)
+        if abs_path not in self._created_dirs:
+            os.makedirs(abs_path, exist_ok=True)
+            self._created_dirs.add(abs_path)
 
     def copy(self, src: str, dst: str) -> None:
         os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
@@ -191,4 +199,3 @@ def validate_filesystem_safety(source: str, destination: str, report_path: str =
                 raise SourcePathError(
                     f"Report path '{candidate}' cannot overwrite generated output or sidecar: {rep_abs}"
                 )
-

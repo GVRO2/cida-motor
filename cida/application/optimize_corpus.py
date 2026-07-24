@@ -1,5 +1,6 @@
 from cida.application.ports import TokenCounter, FileRepository, HashService, JsonCodec, DictionaryBuilder
 from cida.domain.errors import SourcePathError, InternalProcessingError
+from cida.domain.processing_context import FileInventory
 
 
 class CorpusOptimizerUsecase:
@@ -13,10 +14,50 @@ class CorpusOptimizerUsecase:
         self.json_codec = json_codec
         self.dictionary_builder = dictionary_builder
 
-    def build_corpus_dict(self, files: list, src_abs: str) -> tuple:
+    def build_file_inventory(
+        self,
+        src_abs: str,
+        java_processed_relpaths: set[str] | None = None,
+        supported_exts: tuple[str, ...] = ('.md', '.txt', '.py', '.java', '.go', '.js', '.ts'),
+    ) -> FileInventory:
+        java_processed_relpaths = java_processed_relpaths or set()
+        inventory = FileInventory()
+        if self.file_repo.is_file(src_abs):
+            candidates = [src_abs]
+            src_is_dir = False
+        else:
+            candidates = self.file_repo.list_files(src_abs)
+            src_is_dir = True
+
+        for filepath in sorted(candidates):
+            inventory.all_files.append(filepath)
+            rel_p = self.file_repo.relpath(filepath, src_abs).lstrip('./') if src_is_dir else self.file_repo.basename(filepath)
+            ext = "." + filepath.rsplit(".", 1)[1].lower() if "." in filepath else ""
+            is_binary = self.file_repo.is_binary_file(filepath)
+
+            if is_binary:
+                inventory.binary_files.append(filepath)
+                continue
+            if ext in ('.md', '.txt'):
+                inventory.markdown_files.append(filepath)
+            elif ext == '.java':
+                inventory.java_files.append(filepath)
+            elif ext in supported_exts:
+                inventory.code_files.append(filepath)
+
+            if (
+                rel_p not in java_processed_relpaths
+                and not rel_p.startswith("tknd/")
+                and filepath.endswith(supported_exts)
+            ):
+                inventory.processable_files.append(filepath)
+
+        return inventory
+
+    def build_corpus_dict(self, files: list, src_abs: str, skip_binary_check: bool = False) -> tuple:
         all_contents = []
         for fp in files:
-            if not self.file_repo.is_binary_file(fp) and (fp.endswith('.md') or fp.endswith('.txt')):
+            if (skip_binary_check or not self.file_repo.is_binary_file(fp)) and (fp.endswith('.md') or fp.endswith('.txt')):
                 try:
                     all_contents.append(self.file_repo.read_text(fp))
                 except Exception as exc:
@@ -29,7 +70,7 @@ class CorpusOptimizerUsecase:
 
         manifest_files = []
         for fp in files:
-            if not self.file_repo.is_binary_file(fp) and (fp.endswith('.md') or fp.endswith('.txt')):
+            if (skip_binary_check or not self.file_repo.is_binary_file(fp)) and (fp.endswith('.md') or fp.endswith('.txt')):
                 rel = self.file_repo.relpath(fp, src_abs).replace('\\', '/')
                 try:
                     source_bytes = self.file_repo.read_bytes(fp)
