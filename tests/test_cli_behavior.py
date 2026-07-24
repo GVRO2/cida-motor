@@ -3,7 +3,12 @@ import sys
 import pytest
 from unittest.mock import MagicMock, patch
 from cida.domain.errors import TokenizerError
-from cida.interfaces.cli import counter_main, translate_main, main, _accept_token_reducing_candidate
+from cida.application.strict_auditing import StrictBundleAuditor
+from cida.interfaces.cli import (
+    counter_main, translate_main, main, _accept_token_reducing_candidate,
+    _load_semantic_dependencies, _load_strict_bundle_auditor,
+    _requires_identity_semantic_validation,
+)
 
 @pytest.fixture(autouse=True)
 def setup_env():
@@ -63,6 +68,22 @@ def test_accept_token_reducing_candidate_rejects_identical_without_counting():
     assert token_counter.calls == []
 
 
+def test_identity_semantic_validation_detects_frontmatter_only():
+    assert _requires_identity_semantic_validation("---\ntitle: test\n---\nbody") is True
+    assert _requires_identity_semantic_validation("# Title\n\nbody") is False
+
+
+def test_load_strict_bundle_auditor_returns_auditor_class():
+    assert _load_strict_bundle_auditor() is StrictBundleAuditor
+
+
+def test_load_semantic_dependencies_returns_runtime_objects():
+    parsed_cls, validator = _load_semantic_dependencies()
+
+    assert parsed_cls.__name__ == "ParsedOriginalDocument"
+    assert callable(validator)
+
+
 class MagicCounter:
     def __init__(self, counts):
         self.counts = counts
@@ -106,6 +127,36 @@ def test_translate_main_with_source_sidecar(tmp_path):
         translate_main()
 
     mock_print.assert_called_with({"AA": "hello"})
+
+
+def test_translate_main_with_explicit_sidecar(tmp_path):
+    sidecar_file = tmp_path / "dict.cidatkn"
+    sidecar_file.write_text('{"entries": {"AA": "hello"}}', encoding="utf-8")
+
+    with patch.object(sys, "argv", ["translate.py", "--sidecar", str(sidecar_file), "AA"]), \
+         patch("builtins.print") as mock_print:
+        translate_main()
+
+    mock_print.assert_called_with({"AA": "hello"})
+
+
+def test_translate_main_option_without_tokens_exits_usage(tmp_path):
+    sidecar_dir = tmp_path / "sidecar"
+    sidecar_dir.mkdir()
+
+    with patch.object(sys, "argv", ["translate.py", "--path", str(sidecar_dir)]), \
+         pytest.raises(SystemExit) as exc:
+        translate_main()
+
+    assert exc.value.code == 1
+
+
+def test_translate_main_missing_explicit_sidecar(tmp_path):
+    with patch.object(sys, "argv", ["translate.py", "--sidecar", str(tmp_path / "missing.cidatkn"), "AA"]), \
+         pytest.raises(SystemExit) as exc:
+        translate_main()
+
+    assert exc.value.code == 5
 
 
 def test_translate_main_missing_source_sidecar(tmp_path):
