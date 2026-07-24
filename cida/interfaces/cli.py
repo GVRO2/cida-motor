@@ -4,31 +4,34 @@ import argparse
 import time
 import re
 from dataclasses import dataclass, field
-from typing import List
+from typing import Any, List
 from cida.domain.errors import (
     CidaError, SourcePathError
 )
-from cida.domain.policies import validate_mode_profile_combination
+from cida.domain.policies import validate_mode_profile_combination, ValidationLevel, validate_validation_level
 from cida.infrastructure.filesystem import PhysicalFilesystem, validate_filesystem_safety
 from cida.infrastructure.tokenizer import OfflineTokenizer
 from cida.infrastructure.hashing import HashService
 from cida.infrastructure.json_codec import JsonCodec
-from cida.application.optimize_file import FileOptimizerUsecase
 from cida.application.optimize_corpus import CorpusOptimizerUsecase
-from cida.application.validate_sidecar import SidecarValidatorUsecase
+from cida.application.strict_auditing import StrictBundleAuditor
 from cida.application.generate_report import ReportGeneratorUsecase
 from cida.domain.sidecar import create_compressed_envelope
+from cida.domain.processing_context import ProcessingContext
 from cida.markdown.protected_regions import ProtectedRegionsManager
 from cida.markdown.dictionary import apply_dictionary, CorpusDictionaryBuilder
 from cida.markdown.transforms import (
     remove_html_comments, trim_trailing_whitespace, normalize_newlines,
     table_whitespace, list_compaction, minificar_codigo_para_ia
 )
-from cida.markdown.semantic_equivalence import validate_semantics, ParsedOriginalDocument
+
+validate_semantics: Any = None
+ParsedOriginalDocument: Any = None
 
 
 # ── Exit-code categories (severity order: 6 > 5 > 4 > 3 > 2 > 1) ────────────
 _EXIT_CODE_SEVERITY = {6: 6, 5: 5, 4: 4, 3: 3, 2: 2, 1: 1}
+
 
 
 @dataclass
@@ -78,6 +81,41 @@ class CidaArgumentParser(argparse.ArgumentParser):
     def error(self, message):
         sys.stderr.write(f"error: {message}\n")
         sys.exit(1)
+
+
+def _build_processing_context(
+    filepath: str,
+    src_abs: str,
+    requested_profile: str,
+    file_repo: PhysicalFilesystem,
+    file_opt: Any,
+    hash_service: HashService,
+    token_counter: OfflineTokenizer,
+) -> ProcessingContext:
+    source_bytes = file_repo.read_bytes(filepath)
+    source_text = source_bytes.decode('utf-8')
+    source_sha256 = hash_service.sha256(source_bytes)
+    detected_profile = (
+        file_opt.detect_profile(filepath, source_text)
+        if requested_profile == "auto"
+        else requested_profile
+    )
+    relative_path = (
+        file_repo.relpath(filepath, src_abs)
+        if os.path.isdir(src_abs)
+        else os.path.basename(filepath)
+    )
+    return ProcessingContext(
+        source_path=filepath,
+        source_real_path=os.path.normcase(file_repo.abspath(filepath)),
+        relative_path=relative_path,
+        source_bytes=source_bytes,
+        source_text=source_text,
+        source_sha256=source_sha256,
+        original_tokens=token_counter.count(source_text, content_hash=source_sha256),
+        detected_profile=detected_profile,
+    )
+
 
 def counter_main():
     try:
@@ -197,12 +235,22 @@ def main():
         parser.add_argument("--report", default="both", choices=["text", "json", "both"], help="Report format")
         parser.add_argument("--report-path", default="report", help="Report output path (without extension)")
         parser.add_argument("--verify-semantics", action=argparse.BooleanOptionalAction, default=True, help="Run semantic validations")
+        parser.add_argument("--validation-level", choices=["balanced", "strict"], help="Validation security level: balanced (default) or strict")
+        parser.add_argument("--strict-validation", action="store_true", help="Alias for --validation-level strict")
         parser.add_argument("--dry-run", action="store_true", help="Dry run mode (no files written)")
         parser.add_argument("--java-raw-json", help="Path to temporary Java raw metrics JSON")
 
         args = parser.parse_args()
 
+        if args.strict_validation and args.validation_level not in (None, ValidationLevel.STRICT):
+            parser.error("--strict-validation cannot be combined with --validation-level balanced")
+        validation_level = (
+            ValidationLevel.STRICT
+            if args.strict_validation
+            else validate_validation_level(args.validation_level or ValidationLevel.BALANCED)
+        )
         validate_mode_profile_combination(args.mode, args.profile, args.dictionary_scope)
+
 
         file_repo = PhysicalFilesystem(durable=args.durable_writes)
         token_counter = OfflineTokenizer(enable_cache=not args.no_cache)
@@ -230,26 +278,28 @@ def main():
             except Exception as je:
                 print(f"Warning: failed to read Java raw metrics JSON: {je}")
 
-        supported_exts = ('.md', '.txt', '.py', '.java', '.go', '.js', '.ts')
-        files_to_process = []
-        if file_repo.is_file(src_abs):
-            if any(src_abs.endswith(ext) for ext in supported_exts):
-                files_to_process.append(src_abs)
-        else:
-            for filepath in file_repo.list_files(src_abs):
-                rel_p = file_repo.relpath(filepath, src_abs).lstrip('./')
-                if rel_p not in java_processed_relpaths and not rel_p.startswith("tknd/") and any(filepath.endswith(ext) for ext in supported_exts):
-                    files_to_process.append(filepath)
-        files_to_process.sort()
+        report_gen = ReportGeneratorUsecase(file_repo, json_codec)
+        file_opt = None
+        if args.profile == "auto" or args.dictionary_scope == "file":
+            from cida.application.optimize_file import FileOptimizerUsecase
+            file_opt = FileOptimizerUsecase(token_counter, file_repo, hash_service, json_codec)
+        if args.verify_semantics and args.profile in ("auto", "markdown", "bmad"):
+            global validate_semantics, ParsedOriginalDocument
+            from cida.markdown.semantic_equivalence import (
+                ParsedOriginalDocument as _ParsedOriginalDocument,
+                validate_semantics as _validate_semantics,
+            )
+            validate_semantics = _validate_semantics
+            ParsedOriginalDocument = _ParsedOriginalDocument
+        dictionary_builder = CorpusDictionaryBuilder()
+        corpus_opt = CorpusOptimizerUsecase(token_counter, file_repo, hash_service, json_codec, dictionary_builder)
+
+        inventory = corpus_opt.build_file_inventory(src_abs, java_processed_relpaths)
+        files_to_process = inventory.processable_files
 
         if not files_to_process and not java_raw_metrics:
             raise SourcePathError(f"No processable files found in source: {src_abs}")
 
-        report_gen = ReportGeneratorUsecase(file_repo, json_codec)
-        file_opt = FileOptimizerUsecase(token_counter, file_repo, hash_service, json_codec)
-        dictionary_builder = CorpusDictionaryBuilder()
-        corpus_opt = CorpusOptimizerUsecase(token_counter, file_repo, hash_service, json_codec, dictionary_builder)
-        sidecar_val = SidecarValidatorUsecase(file_repo, json_codec, hash_service)
 
 
         for entry in java_raw_metrics:
@@ -282,34 +332,35 @@ def main():
         sidecar_tokens_total = 0
         auxiliary_tokens = 0
 
-        content_cache = {}
+        content_cache: dict[str, ProcessingContext] = {}
 
         if args.dictionary_scope == "corpus":
-            corpus_dict, corpus_hash, sidecar_tokens_total, auxiliary_tokens = corpus_opt.build_corpus_dict(files_to_process, src_abs)
+            corpus_dict, corpus_hash, sidecar_tokens_total, auxiliary_tokens = corpus_opt.build_corpus_dict(
+                files_to_process,
+                src_abs,
+                skip_binary_check=True,
+            )
 
             if corpus_dict:
                 total_orig_tokens = 0
                 total_mini_tokens = 0
                 for fp in files_to_process:
-                    if file_repo.is_binary_file(fp):
-                        continue
                     try:
-                        c_bytes = file_repo.read_bytes(fp)
-                        c = c_bytes.decode('utf-8')
-                        content_cache[fp] = (c, c_bytes)
+                        ctx = _build_processing_context(
+                            fp, src_abs, args.profile, file_repo, file_opt, hash_service, token_counter
+                        )
+                        content_cache[fp] = ctx
                     except Exception as exc:
                         raise SourcePathError(
                             f"Failed to read corpus source for token estimation '{fp}': {exc}"
                         ) from exc
-                    c_sha = hash_service.sha256(c_bytes)
-                    total_orig_tokens += token_counter.count(c, content_hash=c_sha)
-
-                    prof = args.profile
-                    if prof == "auto":
-                        prof = file_opt.detect_profile(fp, c)
+                    c = ctx.source_text
+                    total_orig_tokens += ctx.original_tokens
+                    prof = ctx.detected_profile
 
                     if prof in ["markdown", "bmad"]:
                         curr = c
+                        curr_tokens = ctx.original_tokens
                         curr = remove_html_comments(curr)
                         curr = trim_trailing_whitespace(curr)
                         curr = normalize_newlines(curr)
@@ -317,12 +368,14 @@ def main():
                         curr = list_compaction(curr)
                         pm = ProtectedRegionsManager()
                         cand = apply_dictionary(curr, corpus_dict, pm)
-                        if args.verify_semantics:
+                        if cand != curr and args.verify_semantics:
                             parsed_c = ParsedOriginalDocument(c)
                             is_valid, _ = validate_semantics(c, cand, corpus_dict, parsed_original=parsed_c)
-                            if is_valid and token_counter.count(cand) < token_counter.count(curr):
+                            cand_tokens = token_counter.count(cand)
+                            if is_valid and cand_tokens < token_counter.count(curr):
                                 curr = cand
-                        total_mini_tokens += token_counter.count(curr)
+                                curr_tokens = cand_tokens
+                        total_mini_tokens += curr_tokens if curr == c else token_counter.count(curr)
                     else:
                         mini = minificar_codigo_para_ia(c, corpus_dict)
                         total_mini_tokens += token_counter.count(mini)
@@ -345,20 +398,13 @@ def main():
         for filepath in files_to_process:
             start_time = time.time()
 
-            if file_repo.is_binary_file(filepath):
-                if not args.dry_run:
-                    rel_path = file_repo.relpath(filepath, src_abs) if os.path.isdir(src_abs) else os.path.basename(filepath)
-                    dest_path = os.path.join(dst_abs, rel_path)
-                    file_repo.copy(filepath, dest_path)
-                continue
-
             try:
                 if filepath in content_cache:
-                    content, content_bytes = content_cache[filepath]
+                    ctx = content_cache.pop(filepath)
                 else:
-                    content_bytes = file_repo.read_bytes(filepath)
-                    content = content_bytes.decode('utf-8')
-                    content_cache[filepath] = (content, content_bytes)
+                    ctx = _build_processing_context(
+                        filepath, src_abs, args.profile, file_repo, file_opt, hash_service, token_counter
+                    )
             except Exception as e:
                 print(f"Error reading {filepath}: {e}", file=sys.stderr)
                 report_gen.add_entry(
@@ -382,13 +428,13 @@ def main():
                 aggregator.add(filepath, "read", e if isinstance(e, CidaError) else SourcePathError(str(e)))
                 continue
 
-            profile = args.profile
-            if profile == "auto":
-                profile = file_opt.detect_profile(filepath, content)
+            content = ctx.source_text
+            content_bytes = ctx.source_bytes
+            profile = ctx.detected_profile
             validate_mode_profile_combination(args.mode, args.profile, args.dictionary_scope, profile)
 
-            content_sha = hash_service.sha256(content_bytes)
-            orig_tokens = token_counter.count(content, content_hash=content_sha)
+            content_sha = ctx.source_sha256
+            orig_tokens = ctx.original_tokens
             parsed_orig = ParsedOriginalDocument(content) if (args.verify_semantics and profile in ["markdown", "bmad"]) else None
 
             if profile in ["markdown", "bmad"]:
@@ -417,6 +463,7 @@ def main():
 
             if profile in ["markdown", "bmad"]:
                 current_text = content
+                current_tokens = orig_tokens
 
                 candidates = []
                 if args.mode == "semantic":
@@ -430,6 +477,9 @@ def main():
 
                 for name, trans_fn in candidates:
                     candidate_text = trans_fn(current_text)
+                    if candidate_text == current_text:
+                        rejected_transforms.append(f"{name}_no_gain")
+                        continue
 
                     if args.verify_semantics:
                         is_valid, _ = validate_semantics(content, candidate_text, parsed_original=parsed_orig)
@@ -438,18 +488,17 @@ def main():
                             continue
 
                     cand_tokens = token_counter.count(candidate_text)
-                    curr_tokens = token_counter.count(current_text)
 
-                    if cand_tokens < curr_tokens:
+                    if cand_tokens < current_tokens:
                         current_text = candidate_text
+                        current_tokens = cand_tokens
                         accepted_transforms.append(name)
                     else:
                         rejected_transforms.append(f"{name}_no_gain")
 
                 if args.dictionary_scope == "file":
-                    rel_path = file_repo.relpath(filepath, src_abs) if os.path.isdir(src_abs) else os.path.basename(filepath)
                     candidate_text, sidecar_data, dict_tokens = file_opt.optimize_markdown_dictionary_file_scope(
-                        content, current_text, rel_path, args.verify_semantics
+                        content, current_text, ctx.relative_path, args.verify_semantics, precomputed_source_sha256=content_sha
                     )
                     if sidecar_data:
                         cand_tokens = token_counter.count(candidate_text)
@@ -460,6 +509,7 @@ def main():
                         overhead = cand_sidecar_tokens + cand_aux_tokens
                         if economia_bruta - overhead > 0:
                             current_text = candidate_text
+                            current_tokens = cand_tokens
                             dict_included = True
                             tokens_sidecar = cand_sidecar_tokens
                             tokens_aux = cand_aux_tokens
@@ -478,8 +528,7 @@ def main():
                         is_valid, _ = validate_semantics(content, candidate_text, corpus_dict, parsed_original=parsed_orig)
                         if is_valid:
                             cand_tokens = token_counter.count(candidate_text)
-                            curr_tokens = token_counter.count(current_text)
-                            if cand_tokens < curr_tokens:
+                            if cand_tokens < current_tokens:
                                 cand_sidecar_tokens = int(sidecar_tokens_total * orig_tokens / total_orig_tokens) if total_orig_tokens > 0 else 0
                                 cand_aux_tokens = int(auxiliary_tokens * orig_tokens / total_orig_tokens) if total_orig_tokens > 0 else 0
 
@@ -487,6 +536,7 @@ def main():
                                 overhead = cand_sidecar_tokens + cand_aux_tokens
                                 if economia_bruta - overhead > 0:
                                     current_text = candidate_text
+                                    current_tokens = cand_tokens
                                     dict_included = True
                                     tokens_sidecar = cand_sidecar_tokens
                                     tokens_aux = cand_aux_tokens
@@ -499,7 +549,7 @@ def main():
                             rejected_transforms.append("corpus_dictionary_semantic_fail")
 
                 final_text = current_text
-                final_tokens = token_counter.count(final_text)
+                final_tokens = current_tokens if final_text == current_text else token_counter.count(final_text)
 
                 economia_bruta = orig_tokens - final_tokens
                 overhead = tokens_sidecar + tokens_aux
@@ -553,7 +603,7 @@ def main():
                     print(f"Semantic validation failed for {filepath}: {msg}", file=sys.stderr)
                     sys.exit(3)
 
-            rel_path = file_repo.relpath(filepath, src_abs) if os.path.isdir(src_abs) else os.path.basename(filepath)
+            rel_path = ctx.relative_path
             dest_path = os.path.join(dst_abs, rel_path)
             if profile in ["java", "code"] and not dest_path.endswith('.tknc'):
                 dest_path += '.tknc'
@@ -578,7 +628,12 @@ def main():
                     file_repo.write_text(sidecar_path, json_codec.encode(best_sidecar_data, indent=4))
                 generated_bundles.append((filepath, dest_path, sidecar_path, content_bytes, out_bytes))
 
-            final_written_tokens = token_counter.count(text_to_write)
+            if text_to_write == content:
+                final_written_tokens = orig_tokens
+            elif text_to_write == final_text:
+                final_written_tokens = final_tokens
+            else:
+                final_written_tokens = token_counter.count(text_to_write)
             if final_written_tokens > orig_tokens:
                 inflation_detected = True
                 print(f"WARNING: Inflation in {filepath} ({orig_tokens} -> {final_written_tokens})")
@@ -609,13 +664,13 @@ def main():
             print("Error: Inflation detected during token optimization.")
             sys.exit(1)
 
-        if not args.dry_run:
-            sidecar_val.verify_destination_sidecars(src_abs, dst_abs)
+        if not args.dry_run and validation_level == ValidationLevel.STRICT:
+            strict_auditor = StrictBundleAuditor(file_repo, json_codec, hash_service)
+            strict_auditor.audit_destination_sidecars(src_abs, dst_abs)
             for item in generated_bundles:
                 _, out_f, side_f = item[0], item[1], item[2]
-                src_bytes = item[3] if len(item) > 3 else None
-                out_bytes = item[4] if len(item) > 4 else None
-                sidecar_val.validate_output_bundle(src_abs, dst_abs, out_f, side_f, preloaded_source_bytes=src_bytes, preloaded_output_bytes=out_bytes)
+                strict_auditor.audit_output_bundle(src_abs, dst_abs, out_f, side_f)
+
 
         if aggregator.records:
             aggregator.print_summary()

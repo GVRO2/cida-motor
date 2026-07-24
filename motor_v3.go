@@ -56,19 +56,29 @@ func getToolPath(toolName string) string {
 }
 
 func runPythonCommand(args ...string) *exec.Cmd {
-	cmd := exec.Command("python", args...)
-	// Set environment variable for offline cache
-	cmd.Env = append(os.Environ(), "TIKTOKEN_CACHE_DIR="+filepath.Join(filepath.Dir(getToolPath("token_counter.py")), "resources"))
-	if err := cmd.Start(); err != nil {
-		cmd = exec.Command("python3", args...)
-		cmd.Env = append(os.Environ(), "TIKTOKEN_CACHE_DIR="+filepath.Join(filepath.Dir(getToolPath("token_counter.py")), "resources"))
-	} else {
-		cmd.Process.Kill()
-		cmd = exec.Command("python", args...)
-		cmd.Env = append(os.Environ(), "TIKTOKEN_CACHE_DIR="+filepath.Join(filepath.Dir(getToolPath("token_counter.py")), "resources"))
+	pythonExec := "python"
+	if _, err := exec.LookPath("python"); err != nil {
+		pythonExec = "python3"
 	}
+	cmd := exec.Command(pythonExec, args...)
+	cmd.Env = append(os.Environ(), "TIKTOKEN_CACHE_DIR="+filepath.Join(filepath.Dir(getToolPath("token_counter.py")), "resources"))
 	return cmd
 }
+
+func resolveValidationLevel(validationLevel string, strictValidation bool, validationLevelExplicit bool) (string, error) {
+	if strictValidation {
+		if validationLevelExplicit && validationLevel != "strict" {
+			return "", fmt.Errorf("--strict-validation cannot be combined with --validation-level %s", validationLevel)
+		}
+		return "strict", nil
+	}
+	validValidationLevels := map[string]bool{"balanced": true, "strict": true}
+	if !validValidationLevels[validationLevel] {
+		return "", fmt.Errorf("nivel de validacao invalido: %s", validationLevel)
+	}
+	return validationLevel, nil
+}
+
 
 func estimarTokens(texto string) (int, error) {
 	if texto == "" {
@@ -216,6 +226,7 @@ func main() {
 	profile := "auto"
 	dictScope := "file"
 	mode := "lossless"
+	validationLevel := "balanced"
 	failOnInflation := false
 	reportFormat := "both"
 	reportPath := ""
@@ -224,6 +235,8 @@ func main() {
 	continueOnError := false
 	noCache := false
 	durableWrites := false
+	strictValidation := false
+	validationLevelExplicit := false
 
 	// Parse flags manually to preserve existing go run motor_v3.go <src> [dst] syntax
 	args := os.Args[1:]
@@ -247,6 +260,15 @@ func main() {
 			noCache = true
 		} else if arg == "--durable-writes" {
 			durableWrites = true
+		} else if arg == "--strict-validation" {
+			strictValidation = true
+		} else if strings.HasPrefix(arg, "--validation-level=") {
+			validationLevel = strings.TrimPrefix(arg, "--validation-level=")
+			validationLevelExplicit = true
+		} else if arg == "--validation-level" && i+1 < len(args) {
+			validationLevel = args[i+1]
+			validationLevelExplicit = true
+			i++
 		} else if strings.HasPrefix(arg, "--mode=") {
 			mode = strings.TrimPrefix(arg, "--mode=")
 		} else if arg == "--mode" && i+1 < len(args) {
@@ -279,6 +301,14 @@ func main() {
 			positional = append(positional, arg)
 		}
 	}
+
+	resolvedValidationLevel, validationErr := resolveValidationLevel(validationLevel, strictValidation, validationLevelExplicit)
+	if validationErr != nil {
+		fmt.Printf("❌ Erro: %s\n", validationErr)
+		os.Exit(1)
+	}
+	validationLevel = resolvedValidationLevel
+
 
 	validModes := map[string]bool{"lossless": true, "semantic": true}
 	if !validModes[mode] {
@@ -426,13 +456,14 @@ func main() {
 
 			if changed {
 				fmt.Println("🔄 Alteração detectada, recompilando...")
-				processarEComparar(pastaOrig, pastaComp, mode, profile, dictScope, failOnInflation, reportFormat, reportPath, verifySemantics, dryRun, continueOnError, noCache, durableWrites)
+				processarEComparar(pastaOrig, pastaComp, mode, profile, dictScope, validationLevel, failOnInflation, reportFormat, reportPath, verifySemantics, dryRun, continueOnError, noCache, durableWrites)
 			}
 			time.Sleep(2 * time.Second)
 		}
 	} else {
-		processarEComparar(pastaOrig, pastaComp, mode, profile, dictScope, failOnInflation, reportFormat, reportPath, verifySemantics, dryRun, continueOnError, noCache, durableWrites)
+		processarEComparar(pastaOrig, pastaComp, mode, profile, dictScope, validationLevel, failOnInflation, reportFormat, reportPath, verifySemantics, dryRun, continueOnError, noCache, durableWrites)
 	}
+
 }
 
 func isCodeExtension(ext string) bool {
@@ -501,7 +532,7 @@ type JavaRawMetric struct {
 	TokensAuxiliares int    `json:"tokens_auxiliares"`
 }
 
-func processarEComparar(pastaOrig string, pastaComp string, mode string, profile string, dictScope string, failOnInflation bool, reportFormat string, reportPath string, verifySemantics bool, dryRun bool, continueOnError bool, noCache bool, durableWrites bool) {
+func processarEComparar(pastaOrig string, pastaComp string, mode string, profile string, dictScope string, validationLevel string, failOnInflation bool, reportFormat string, reportPath string, verifySemantics bool, dryRun bool, continueOnError bool, noCache bool, durableWrites bool) {
 	absOrig, err := filepath.Abs(pastaOrig)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Erro ao resolver caminho de origem: %v\n", err)
@@ -788,6 +819,7 @@ func processarEComparar(pastaOrig string, pastaComp string, mode string, profile
 			"--mode", mode,
 			"--profile", profile,
 			"--dictionary-scope", dictScope,
+			"--validation-level", validationLevel,
 			"--report", reportFormat,
 			"--report-path", reportPath,
 		}

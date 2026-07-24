@@ -1,4 +1,5 @@
 import re
+from enum import Enum
 
 def classify_comment(comment_text: str) -> str:
     """
@@ -71,4 +72,33 @@ def validate_mode_profile_combination(mode: str, profile: str, dictionary_scope:
             )
 
 
+class ValidationLevel(str, Enum):
+    BALANCED = "balanced"
+    STRICT = "strict"
 
+    @classmethod
+    def all(cls) -> list[str]:
+        return [level.value for level in cls]
+
+
+def validate_validation_level(level: str | ValidationLevel) -> ValidationLevel:
+    """Validates and normalizes the validation level string.
+
+    Raises UsageError if invalid.
+    """
+    from cida.domain.errors import UsageError
+
+    if isinstance(level, ValidationLevel):
+        return level
+
+    if not isinstance(level, str):
+        raise UsageError(
+            f"Invalid validation level '{level}'. Allowed values are: {', '.join(ValidationLevel.all())}"
+        )
+
+    normalized_level = level.lower()
+    if normalized_level not in ValidationLevel.all():
+        raise UsageError(
+            f"Invalid validation level '{level}'. Allowed values are: {', '.join(ValidationLevel.all())}"
+        )
+    return ValidationLevel(normalized_level)
