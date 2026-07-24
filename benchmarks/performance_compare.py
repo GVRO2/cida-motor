@@ -39,7 +39,7 @@ def _export_ref(repo: Path, ref: str, destination: Path) -> None:
 
 
 def _copy_head(repo: Path, destination: Path) -> None:
-    ignored = {".git", ".pytest_cache", ".mypy_cache", ".ruff_cache", "__pycache__"}
+    ignored = {".git", ".cida-local", ".runtime", ".pytest_cache", ".mypy_cache", ".ruff_cache", "__pycache__"}
 
     def ignore(_dir: str, names: list[str]) -> set[str]:
         return {name for name in names if name in ignored or name.endswith("_mimificado")}
@@ -52,6 +52,13 @@ def _build_binary(project: Path, output: Path) -> None:
     result = _run(["go", "build", "-o", str(exe), "motor_v3.go"], project)
     if result.returncode != 0:
         raise RuntimeError(f"go build failed in {project}:\n{result.stderr}")
+
+
+def _python_cli_command(project: Path) -> list[str]:
+    script = project / "token_optimizer.py"
+    if script.exists():
+        return [sys.executable, str(script)]
+    return [sys.executable, "-c", "from cida.interfaces.cli import main; main()"]
 
 
 def _process_rss_bytes(pid: int) -> int:
@@ -127,15 +134,41 @@ def _write_scenario(root: Path, name: str, file_count: int, kind: str) -> tuple[
     return source, len(paths), total_bytes
 
 
-def _read_report_tokens(destination: Path) -> int:
+def _read_report_entries(destination: Path) -> list[dict]:
     report = destination / "report.json"
     if not report.exists():
-        return 0
+        return []
     try:
-        entries = json.loads(report.read_text(encoding="utf-8"))
+        data = json.loads(report.read_text(encoding="utf-8"))
     except Exception:
-        return 0
-    return int(sum(entry.get("tokens_originais", 0) for entry in entries))
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _read_report_tokens(destination: Path) -> int:
+    return int(sum(entry.get("tokens_originais", 0) for entry in _read_report_entries(destination)))
+
+
+def _source_inventory(source: Path) -> dict[str, int]:
+    return {
+        path.relative_to(source).as_posix(): path.stat().st_size
+        for path in source.rglob("*")
+        if path.is_file()
+    }
+
+
+def _output_inventory(destination: Path) -> tuple[int, int, int]:
+    outputs_created = 0
+    sidecars_created = 0
+    output_bytes = 0
+    for path in destination.rglob("*"):
+        if not path.is_file():
+            continue
+        outputs_created += 1
+        output_bytes += path.stat().st_size
+        if path.name.endswith(".cidatkn"):
+            sidecars_created += 1
+    return outputs_created, sidecars_created, output_bytes
 
 
 def _supports_flag(project: Path, command: list[str], flag: str) -> bool:
@@ -147,6 +180,7 @@ def _measure(command: list[str], project: Path, source: Path, destination: Path,
     if destination.exists():
         shutil.rmtree(destination)
     destination.mkdir(parents=True)
+    source_files = _source_inventory(source)
 
     if command[-1].endswith("motor_v3.exe") or command[-1].endswith("motor_v3"):
         cmd = [*command, str(source), str(destination), *flags]
@@ -183,14 +217,36 @@ def _measure(command: list[str], project: Path, source: Path, destination: Path,
 
     file_count = sum(1 for path in source.rglob("*") if path.is_file())
     token_count = _read_report_tokens(destination)
+    report_entries = _read_report_entries(destination)
+    processed_paths = {
+        str(entry.get("arquivo", "")).replace("\\", "/")
+        for entry in report_entries
+        if entry.get("arquivo")
+    }
+    bytes_processed = sum(source_files.get(path, 0) for path in processed_paths)
+    if not report_entries:
+        bytes_processed = 0
+    outputs_created, sidecars_created, output_bytes = _output_inventory(destination)
     return {
         "duration_seconds": elapsed,
         "peak_rss_bytes": peak_rss,
         "files_per_second": file_count / elapsed if elapsed > 0 else 0,
+        "mb_per_second": (bytes_processed / (1024 * 1024)) / elapsed if elapsed > 0 else 0,
+        "milliseconds_per_file": (elapsed * 1000) / len(report_entries) if report_entries else 0,
+        "milliseconds_per_mb": (elapsed * 1000) / (bytes_processed / (1024 * 1024)) if bytes_processed else 0,
         "tokens_per_second": token_count / elapsed if elapsed > 0 else 0,
         "hash_calls": file_count,
         "tokenizer_calls": max(token_count and file_count, file_count),
         "subprocess_count": 1,
+        "files_discovered": len(source_files),
+        "files_processed": len(report_entries),
+        "files_skipped": max(len(source_files) - len(report_entries), 0),
+        "bytes_discovered": sum(source_files.values()),
+        "bytes_processed": bytes_processed,
+        "outputs_created": outputs_created,
+        "sidecars_created": sidecars_created,
+        "output_bytes": output_bytes,
+        "exit_code": proc.returncode,
     }
 
 
@@ -244,11 +300,23 @@ def _summarize(samples: list[dict], output_hashes: list[str]) -> dict:
         "peak_rss": max(rss_values),
         "files_per_second": statistics.median(files_per_second),
         "tokens_per_second": statistics.median(tokens_per_second),
+        "mb_per_second": statistics.median(sample["mb_per_second"] for sample in samples),
+        "milliseconds_per_file": statistics.median(sample["milliseconds_per_file"] for sample in samples),
+        "milliseconds_per_mb": statistics.median(sample["milliseconds_per_mb"] for sample in samples),
         "hash_calls": max(sample["hash_calls"] for sample in samples),
         "tokenizer_calls": max(sample["tokenizer_calls"] for sample in samples),
         "subprocess_count": max(sample["subprocess_count"] for sample in samples),
-        "exit_codes": [0] * len(samples),
+        "exit_codes": [sample["exit_code"] for sample in samples],
         "output_hash": output_hashes[-1] if output_hashes else "",
+        "output_tree_sha256": output_hashes[-1] if output_hashes else "",
+        "files_discovered": max(sample["files_discovered"] for sample in samples),
+        "files_processed": max(sample["files_processed"] for sample in samples),
+        "files_skipped": max(sample["files_skipped"] for sample in samples),
+        "bytes_discovered": max(sample["bytes_discovered"] for sample in samples),
+        "bytes_processed": max(sample["bytes_processed"] for sample in samples),
+        "outputs_created": max(sample["outputs_created"] for sample in samples),
+        "sidecars_created": max(sample["sidecars_created"] for sample in samples),
+        "output_bytes": max(sample["output_bytes"] for sample in samples),
     }
 
 
@@ -264,8 +332,10 @@ def main() -> None:
     parser.add_argument("--head-dir", default=".")
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--warmups", type=int, default=1)
+    parser.add_argument("--validation-level", default="balanced", choices=["balanced", "strict"], help="Validation level for performance comparison")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
+
 
     repo = Path(args.head_dir).resolve()
     temp_root = Path(tempfile.mkdtemp(prefix="cida-performance-compare-"))
@@ -315,17 +385,22 @@ def main() -> None:
             "temp_root": str(temp_root),
             "warmups": args.warmups,
             "runs": args.runs,
+            "validation_level": args.validation_level,
             "budgets": {
                 "median": MEDIAN_BUDGET,
                 "p95": P95_BUDGET,
                 "peak_rss": RSS_BUDGET,
+                "enforced": args.validation_level == "balanced",
             },
             "scenarios": {},
         }
 
         failed = []
-        base_python_cmd = [sys.executable, "-m", "cida.interfaces.cli"]
+        base_python_cmd = _python_cli_command(base_dir)
+        head_python_cmd = _python_cli_command(head_dir)
         base_supports_no_cache = _supports_flag(base_dir, base_python_cmd, "--no-cache")
+        base_supports_val_level = _supports_flag(base_dir, base_python_cmd, "--validation-level")
+
 
         for scenario_name, runner, file_count, kind, flags in scenarios:
             scenario_root = temp_root / "scenarios" / scenario_name
@@ -354,25 +429,39 @@ def main() -> None:
             hashes_map = {"base": [], "head": []}
             unsupported_base_flags = []
 
+            def build_effective_flags(version: str, proj: Path) -> list[str]:
+                eff = list(flags)
+                if args.validation_level != "balanced" and "--validation-level" not in eff:
+                    eff.extend(["--validation-level", args.validation_level])
+                if version == "base":
+                    if "--no-cache" in eff and not base_supports_no_cache:
+                        eff.remove("--no-cache")
+                        unsupported_base_flags.append("--no-cache")
+                    if "--validation-level" in eff and not base_supports_val_level:
+                        idx = eff.index("--validation-level")
+                        eff.pop(idx)
+                        if idx < len(eff):
+                            eff.pop(idx)
+                        unsupported_base_flags.append("--validation-level")
+                return eff
+
             # Warmups: alternating order
             for w in range(args.warmups):
-                for version, binary, project in version_configs:
-                    command = [str(binary)] if runner == "go" else ([sys.executable, "-m", "cida.interfaces.cli"])
-                    effective_flags = list(flags)
-                    if version == "base" and "--no-cache" in effective_flags and not base_supports_no_cache:
-                        effective_flags.remove("--no-cache")
-                        unsupported_base_flags.append("--no-cache")
+                warmup_order = version_configs if w % 2 == 0 else list(reversed(version_configs))
+                for version, binary, project in warmup_order:
+                    command = [str(binary)] if runner == "go" else (base_python_cmd if version == "base" else head_python_cmd)
+                    effective_flags = build_effective_flags(version, project)
                     dest = temp_root / "runs" / scenario_name / version / f"warmup-{w:02d}"
                     _measure(command, project, source, dest, effective_flags)
 
             # Measured runs: alternating order
             for r in range(args.runs):
-                for version, binary, project in version_configs:
-                    command = [str(binary)] if runner == "go" else ([sys.executable, "-m", "cida.interfaces.cli"])
-                    effective_flags = list(flags)
-                    if version == "base" and "--no-cache" in effective_flags and not base_supports_no_cache:
-                        effective_flags.remove("--no-cache")
+                run_order = version_configs if r % 2 == 0 else list(reversed(version_configs))
+                for version, binary, project in run_order:
+                    command = [str(binary)] if runner == "go" else (base_python_cmd if version == "base" else head_python_cmd)
+                    effective_flags = build_effective_flags(version, project)
                     dest = temp_root / "runs" / scenario_name / version / f"run-{r:02d}"
+
                     sample = _measure(command, project, source, dest, effective_flags)
                     samples_map[version].append(sample)
                     hashes_map[version].append(_compute_tree_sha256(dest))
@@ -393,7 +482,7 @@ def main() -> None:
             is_unstable = base_summary["cv"] > 0.10 or head_summary["cv"] > 0.10
             stability_str = "UNSTABLE" if is_unstable else "STABLE"
 
-            if not budget_result:
+            if args.validation_level == "balanced" and not budget_result:
                 failed.append(scenario_name)
 
             cmd_str = f"motor_v3 {' '.join(flags)}" if runner == "go" else f"python -m cida.interfaces.cli {' '.join(flags)}"
@@ -408,6 +497,7 @@ def main() -> None:
                 "verify_semantics": verify_semantics,
                 "cache_enabled": cache_enabled,
                 "durable_writes": durable_writes,
+                "validation_level": args.validation_level,
                 "warmups": args.warmups,
                 "runs": args.runs,
                 "flags": flags,
@@ -417,6 +507,7 @@ def main() -> None:
                 "comparison": comparison,
                 "stability": stability_str,
                 "budget_result": "PASS" if budget_result else "FAIL",
+                "budget_enforced": args.validation_level == "balanced",
             }
 
         results["overall_result"] = "PASS" if not failed else "FAIL"
@@ -440,4 +531,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
