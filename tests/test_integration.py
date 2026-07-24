@@ -70,7 +70,9 @@ class TestPipelineIntegration(unittest.TestCase):
         # Setup Tiktoken cache dir env variable
         env = os.environ.copy()
         env["TIKTOKEN_CACHE_DIR"] = os.path.abspath("resources")
-        env["GOCACHE"] = os.path.join(self.test_dir, "go-build-cache")
+        go_cache = os.path.abspath(os.path.join(".cida-local", "go-build-cache"))
+        os.makedirs(go_cache, exist_ok=True)
+        env["GOCACHE"] = go_cache
 
         result = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
         self.assertEqual(result.returncode, 0, f"Execution failed:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
