@@ -488,8 +488,9 @@ def main():
                             continue
 
                     cand_tokens = token_counter.count(candidate_text)
+                    curr_tokens = token_counter.count(current_text)
 
-                    if cand_tokens < current_tokens:
+                    if cand_tokens < curr_tokens:
                         current_text = candidate_text
                         current_tokens = cand_tokens
                         accepted_transforms.append(name)
@@ -528,7 +529,8 @@ def main():
                         is_valid, _ = validate_semantics(content, candidate_text, corpus_dict, parsed_original=parsed_orig)
                         if is_valid:
                             cand_tokens = token_counter.count(candidate_text)
-                            if cand_tokens < current_tokens:
+                            curr_tokens = token_counter.count(current_text)
+                            if cand_tokens < curr_tokens:
                                 cand_sidecar_tokens = int(sidecar_tokens_total * orig_tokens / total_orig_tokens) if total_orig_tokens > 0 else 0
                                 cand_aux_tokens = int(auxiliary_tokens * orig_tokens / total_orig_tokens) if total_orig_tokens > 0 else 0
 
@@ -549,7 +551,7 @@ def main():
                             rejected_transforms.append("corpus_dictionary_semantic_fail")
 
                 final_text = current_text
-                final_tokens = current_tokens if final_text == current_text else token_counter.count(final_text)
+                final_tokens = token_counter.count(final_text)
 
                 economia_bruta = orig_tokens - final_tokens
                 overhead = tokens_sidecar + tokens_aux
@@ -628,12 +630,7 @@ def main():
                     file_repo.write_text(sidecar_path, json_codec.encode(best_sidecar_data, indent=4))
                 generated_bundles.append((filepath, dest_path, sidecar_path, content_bytes, out_bytes))
 
-            if text_to_write == content:
-                final_written_tokens = orig_tokens
-            elif text_to_write == final_text:
-                final_written_tokens = final_tokens
-            else:
-                final_written_tokens = token_counter.count(text_to_write)
+            final_written_tokens = token_counter.count(text_to_write)
             if final_written_tokens > orig_tokens:
                 inflation_detected = True
                 print(f"WARNING: Inflation in {filepath} ({orig_tokens} -> {final_written_tokens})")
