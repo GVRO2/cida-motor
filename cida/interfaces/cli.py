@@ -3,6 +3,8 @@ import sys
 import argparse
 import time
 import re
+from dataclasses import dataclass, field
+from typing import List
 from cida.domain.errors import (
     CidaError, SourcePathError
 )
@@ -22,7 +24,55 @@ from cida.markdown.transforms import (
     remove_html_comments, trim_trailing_whitespace, normalize_newlines,
     table_whitespace, list_compaction, minificar_codigo_para_ia
 )
-from cida.markdown.semantic_equivalence import validate_semantics
+from cida.markdown.semantic_equivalence import validate_semantics, ParsedOriginalDocument
+
+
+# ── Exit-code categories (severity order: 6 > 5 > 4 > 3 > 2 > 1) ────────────
+_EXIT_CODE_SEVERITY = {6: 6, 5: 5, 4: 4, 3: 3, 2: 2, 1: 1}
+
+
+@dataclass
+class FailureRecord:
+    filepath: str
+    operation: str
+    error_type: str
+    exit_code: int
+    message: str
+
+
+@dataclass
+class FailureAggregator:
+    records: List[FailureRecord] = field(default_factory=list)
+
+    def add(self, filepath: str, operation: str, exc: Exception) -> None:
+        exit_code = getattr(exc, 'exit_code', 6)
+        self.records.append(FailureRecord(
+            filepath=filepath,
+            operation=operation,
+            error_type=type(exc).__name__,
+            exit_code=exit_code,
+            message=str(exc),
+        ))
+
+    @property
+    def final_exit_code(self) -> int:
+        if not self.records:
+            return 0
+        return max(_EXIT_CODE_SEVERITY.get(r.exit_code, 6) for r in self.records)
+
+    @property
+    def categories(self) -> List[int]:
+        return sorted({r.exit_code for r in self.records}, reverse=True)
+
+    def print_summary(self) -> None:
+        print(
+            f"\nFAILED_FILES={len(self.records)}",
+            f"FAILURE_CATEGORIES={self.categories}",
+            f"FINAL_EXIT_CODE={self.final_exit_code}",
+            sep="\n",
+            file=sys.stderr,
+        )
+
 
 class CidaArgumentParser(argparse.ArgumentParser):
     def error(self, message):
@@ -232,6 +282,8 @@ def main():
         sidecar_tokens_total = 0
         auxiliary_tokens = 0
 
+        content_cache = {}
+
         if args.dictionary_scope == "corpus":
             corpus_dict, corpus_hash, sidecar_tokens_total, auxiliary_tokens = corpus_opt.build_corpus_dict(files_to_process, src_abs)
 
@@ -242,10 +294,15 @@ def main():
                     if file_repo.is_binary_file(fp):
                         continue
                     try:
-                        c = file_repo.read_text(fp)
-                    except Exception:
-                        continue
-                    total_orig_tokens += token_counter.count(c)
+                        c_bytes = file_repo.read_bytes(fp)
+                        c = c_bytes.decode('utf-8')
+                        content_cache[fp] = (c, c_bytes)
+                    except Exception as exc:
+                        raise SourcePathError(
+                            f"Failed to read corpus source for token estimation '{fp}': {exc}"
+                        ) from exc
+                    c_sha = hash_service.sha256(c_bytes)
+                    total_orig_tokens += token_counter.count(c, content_hash=c_sha)
 
                     prof = args.profile
                     if prof == "auto":
@@ -261,7 +318,8 @@ def main():
                         pm = ProtectedRegionsManager()
                         cand = apply_dictionary(curr, corpus_dict, pm)
                         if args.verify_semantics:
-                            is_valid, _ = validate_semantics(c, cand, corpus_dict)
+                            parsed_c = ParsedOriginalDocument(c)
+                            is_valid, _ = validate_semantics(c, cand, corpus_dict, parsed_original=parsed_c)
                             if is_valid and token_counter.count(cand) < token_counter.count(curr):
                                 curr = cand
                         total_mini_tokens += token_counter.count(curr)
@@ -282,7 +340,7 @@ def main():
                     corpus_hash = ""
 
         inflation_detected = False
-        has_failed_file = False
+        aggregator = FailureAggregator()
 
         for filepath in files_to_process:
             start_time = time.time()
@@ -295,9 +353,13 @@ def main():
                 continue
 
             try:
-                content = file_repo.read_text(filepath)
+                if filepath in content_cache:
+                    content, content_bytes = content_cache[filepath]
+                else:
+                    content_bytes = file_repo.read_bytes(filepath)
+                    content = content_bytes.decode('utf-8')
+                    content_cache[filepath] = (content, content_bytes)
             except Exception as e:
-                has_failed_file = True
                 print(f"Error reading {filepath}: {e}", file=sys.stderr)
                 report_gen.add_entry(
                     filepath=filepath,
@@ -317,6 +379,7 @@ def main():
                     if isinstance(e, CidaError):
                         raise
                     raise CidaError(f"Failed to read file {filepath}: {e}") from e
+                aggregator.add(filepath, "read", e if isinstance(e, CidaError) else SourcePathError(str(e)))
                 continue
 
             profile = args.profile
@@ -324,7 +387,9 @@ def main():
                 profile = file_opt.detect_profile(filepath, content)
             validate_mode_profile_combination(args.mode, args.profile, args.dictionary_scope, profile)
 
-            orig_tokens = token_counter.count(content)
+            content_sha = hash_service.sha256(content_bytes)
+            orig_tokens = token_counter.count(content, content_hash=content_sha)
+            parsed_orig = ParsedOriginalDocument(content) if (args.verify_semantics and profile in ["markdown", "bmad"]) else None
 
             if profile in ["markdown", "bmad"]:
                 legacy = re.sub(r'^---\s*[\r\n]+.*?[\r\n]+---\s*[\r\n]+', '', content, flags=re.DOTALL)
@@ -367,7 +432,7 @@ def main():
                     candidate_text = trans_fn(current_text)
 
                     if args.verify_semantics:
-                        is_valid, _ = validate_semantics(content, candidate_text)
+                        is_valid, _ = validate_semantics(content, candidate_text, parsed_original=parsed_orig)
                         if not is_valid:
                             rejected_transforms.append(f"{name}_semantic_fail")
                             continue
@@ -410,7 +475,7 @@ def main():
                     candidate_text = apply_dictionary(current_text, corpus_dict, pm)
 
                     if args.verify_semantics:
-                        is_valid, _ = validate_semantics(content, candidate_text, corpus_dict)
+                        is_valid, _ = validate_semantics(content, candidate_text, corpus_dict, parsed_original=parsed_orig)
                         if is_valid:
                             cand_tokens = token_counter.count(candidate_text)
                             curr_tokens = token_counter.count(current_text)
@@ -480,7 +545,7 @@ def main():
                     elif corpus_dict:
                         validation_dict = corpus_dict
                 try:
-                    is_valid, msg = validate_semantics(content, final_text, validation_dict)
+                    is_valid, msg = validate_semantics(content, final_text, validation_dict, parsed_original=parsed_orig)
                 except Exception as ve:
                     is_valid = False
                     msg = str(ve)
@@ -507,10 +572,11 @@ def main():
                 sidecar_path = dest_path + ".cidatkn"
 
             if not args.dry_run:
-                file_repo.write_bytes(dest_path, text_to_write.encode('utf-8'))
+                out_bytes = text_to_write.encode('utf-8')
+                file_repo.write_bytes(dest_path, out_bytes)
                 if sidecar_path:
                     file_repo.write_text(sidecar_path, json_codec.encode(best_sidecar_data, indent=4))
-                generated_bundles.append((filepath, dest_path, sidecar_path))
+                generated_bundles.append((filepath, dest_path, sidecar_path, content_bytes, out_bytes))
 
             final_written_tokens = token_counter.count(text_to_write)
             if final_written_tokens > orig_tokens:
@@ -545,12 +611,16 @@ def main():
 
         if not args.dry_run:
             sidecar_val.verify_destination_sidecars(src_abs, dst_abs)
-            for orig_f, out_f, side_f in generated_bundles:
-                sidecar_val.validate_output_bundle(src_abs, dst_abs, out_f, side_f)
+            for item in generated_bundles:
+                _, out_f, side_f = item[0], item[1], item[2]
+                src_bytes = item[3] if len(item) > 3 else None
+                out_bytes = item[4] if len(item) > 4 else None
+                sidecar_val.validate_output_bundle(src_abs, dst_abs, out_f, side_f, preloaded_source_bytes=src_bytes, preloaded_output_bytes=out_bytes)
 
-        if has_failed_file:
+        if aggregator.records:
+            aggregator.print_summary()
             print("Error: One or more files failed to process during execution.", file=sys.stderr)
-            sys.exit(6)
+            sys.exit(aggregator.final_exit_code)
 
     except CidaError as ce:
         print(f"CIDA execution error: {ce}", file=sys.stderr)

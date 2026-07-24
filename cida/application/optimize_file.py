@@ -4,7 +4,7 @@ from cida.application.ports import TokenCounter, FileRepository, HashService, Js
 from cida.markdown.protected_regions import ProtectedRegionsManager
 from cida.markdown.dictionary import generate_alias_candidates, find_candidate_words, apply_dictionary
 from cida.domain.sidecar import create_sidecar_data
-from cida.markdown.semantic_equivalence import validate_semantics
+from cida.markdown.semantic_equivalence import validate_semantics, ParsedOriginalDocument
 
 class FileOptimizerUsecase:
     """Orchestrates token minification and dictionary replacement for a single file."""
@@ -46,6 +46,9 @@ class FileOptimizerUsecase:
         return 'markdown'
 
     def optimize_markdown_dictionary_file_scope(self, content: str, transformed_text: str, filepath: str, verify_semantics: bool) -> tuple:
+        content_bytes = content.encode('utf-8')
+        source_sha256 = self.hash_service.sha256(content_bytes)
+
         base_tokens = self.token_counter.count(transformed_text)
         best_tokens = base_tokens
         best_minified = transformed_text
@@ -84,6 +87,8 @@ class FileOptimizerUsecase:
         if not current_dict:
             return transformed_text, None, 0
 
+        parsed_orig = ParsedOriginalDocument(content) if verify_semantics else None
+
         words_to_eval = list(current_dict.items())
         working_dict = {}
 
@@ -93,13 +98,13 @@ class FileOptimizerUsecase:
             entries_dict = {a: w for w, a in working_dict.items()}
 
             try:
-                sidecar_data = create_sidecar_data(filepath, content.encode('utf-8'), entries_dict, self.hash_service)
+                sidecar_data = create_sidecar_data(filepath, content_bytes, entries_dict, self.hash_service, precomputed_sha256=source_sha256)
             except Exception:
                 working_dict.pop(word)
                 continue
 
             if verify_semantics:
-                is_valid, _ = validate_semantics(content, candidate_minified, working_dict)
+                is_valid, _ = validate_semantics(content, candidate_minified, working_dict, parsed_original=parsed_orig)
                 if not is_valid:
                     working_dict.pop(word)
                     continue
@@ -129,5 +134,3 @@ class FileOptimizerUsecase:
 
         final_sidecar_tokens = self.token_counter.count(self.json_codec.encode(best_sidecar_data, indent=4)) if best_sidecar_data else 0
         return best_minified, best_sidecar_data, final_sidecar_tokens
-
-

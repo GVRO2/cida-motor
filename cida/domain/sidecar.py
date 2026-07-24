@@ -96,7 +96,22 @@ def parse_compressed_envelope(content: str) -> tuple[dict[str, Any] | None, str]
 
     return metadata, payload
 
-def reconcile_envelope_and_sidecar(envelope_meta: dict, sidecar_data: dict, actual_sidecar_filename: str = ""):
+def reconcile_envelope_and_sidecar(
+    envelope_meta: dict,
+    sidecar_data: dict,
+    actual_sidecar_filename: str = "",
+    compressed_file: str = "",
+    # Pre-resolved physical paths (supplied by the application layer).
+    # When provided, physical path comparison is used instead of basename.
+    resolved_declared_ref: str = "",
+    resolved_actual_sidecar: str = "",
+) -> None:
+    """Reconcile envelope metadata with sidecar data.
+
+    The application layer is responsible for resolving physical paths via
+    `os.path.realpath` and passing *resolved_declared_ref* and
+    *resolved_actual_sidecar*. The domain layer stays pure (no I/O, no `os`).
+    """
     if envelope_meta.get("version") != sidecar_data.get("version"):
         raise SidecarValidationError(
             f"Envelope version ({envelope_meta.get('version')}) disagrees with sidecar version ({sidecar_data.get('version')})"
@@ -110,14 +125,30 @@ def reconcile_envelope_and_sidecar(envelope_meta: dict, sidecar_data: dict, actu
         )
 
     if actual_sidecar_filename:
-        declared_ref = envelope_meta.get("sidecar_ref", "").replace('\\', '/').split('/')[-1]
-        actual_name = actual_sidecar_filename.replace('\\', '/').split('/')[-1]
-        if declared_ref != actual_name:
-            raise SidecarValidationError(
-                f"Declared sidecar_ref '{declared_ref}' disagrees with loaded sidecar '{actual_name}'"
-            )
+        declared_ref = envelope_meta.get("sidecar_ref", "")
+        if resolved_declared_ref and resolved_actual_sidecar:
+            # Physical path comparison supplied by application layer.
+            if resolved_declared_ref != resolved_actual_sidecar:
+                raise SidecarValidationError(
+                    f"Declared sidecar_ref '{declared_ref}' (resolved: {resolved_declared_ref}) "
+                    f"disagrees with loaded sidecar path '{actual_sidecar_filename}' "
+                    f"(resolved: {resolved_actual_sidecar})"
+                )
+        else:
+            # Fallback to basename comparison when resolved paths are not available.
+            declared_name = declared_ref.replace('\\', '/').split('/')[-1]
+            actual_name = actual_sidecar_filename.replace('\\', '/').split('/')[-1]
+            if declared_name != actual_name:
+                raise SidecarValidationError(
+                    f"Declared sidecar_ref '{declared_name}' disagrees with loaded sidecar '{actual_name}'"
+                )
 
-def create_sidecar_data(source_name: str, original_content: bytes, entries: dict, hash_service) -> dict:
+# NOTE: validate_sidecar_ref_physical is defined in
+# cida.application.validate_sidecar (application layer) because it uses `os`
+# for physical path resolution, which is forbidden in the domain layer.
+
+
+def create_sidecar_data(source_name: str, original_content: bytes, entries: dict, hash_service, precomputed_sha256: str = "") -> dict:
     if not isinstance(entries, dict):
         raise SidecarValidationError("Entries must be a dictionary")
 
@@ -140,11 +171,12 @@ def create_sidecar_data(source_name: str, original_content: bytes, entries: dict
         sorted_entries[alias] = entries[alias]
 
     source_rel = source_name.replace('\\', '/')
+    sha = precomputed_sha256 if precomputed_sha256 else hash_service.sha256(original_content)
     return {
         "format": "cida-token-sidecar",
         "version": 1,
         "source": source_rel,
-        "source_sha256": hash_service.sha256(original_content),
+        "source_sha256": sha,
         "entries": sorted_entries
     }
 

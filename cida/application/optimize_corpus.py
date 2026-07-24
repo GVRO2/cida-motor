@@ -1,4 +1,6 @@
 from cida.application.ports import TokenCounter, FileRepository, HashService, JsonCodec, DictionaryBuilder
+from cida.domain.errors import SourcePathError, InternalProcessingError
+
 
 class CorpusOptimizerUsecase:
     """Orchestrates corpus-wide dictionary generation and sidecar writing."""
@@ -17,8 +19,10 @@ class CorpusOptimizerUsecase:
             if not self.file_repo.is_binary_file(fp) and (fp.endswith('.md') or fp.endswith('.txt')):
                 try:
                     all_contents.append(self.file_repo.read_text(fp))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    raise SourcePathError(
+                        f"Failed to read corpus source '{fp}': {exc}"
+                    ) from exc
         corpus_dict = self.dictionary_builder.build_corpus_dictionary(all_contents, self.token_counter)
         if not corpus_dict:
             return {}, "", 0, 0
@@ -28,10 +32,13 @@ class CorpusOptimizerUsecase:
             if not self.file_repo.is_binary_file(fp) and (fp.endswith('.md') or fp.endswith('.txt')):
                 rel = self.file_repo.relpath(fp, src_abs).replace('\\', '/')
                 try:
-                    sha = self.hash_service.sha256(self.file_repo.read_bytes(fp))
+                    source_bytes = self.file_repo.read_bytes(fp)
+                    sha = self.hash_service.sha256(source_bytes)
                     manifest_files.append({"path": rel, "sha256": sha})
-                except Exception:
-                    pass
+                except Exception as exc:
+                    raise InternalProcessingError(
+                        f"Failed to hash corpus source '{fp}': {exc}"
+                    ) from exc
         manifest_files.sort(key=lambda x: x["path"])
         manifest = {"files": manifest_files}
         manifest_bytes = self.json_codec.canonical_encode(manifest).encode('utf-8')
