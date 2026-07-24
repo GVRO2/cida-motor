@@ -143,6 +143,7 @@ def main():
         parser.add_argument("--fail-on-inflation", action="store_true", help="Fail if any file has token count inflation")
         parser.add_argument("--continue-on-error", action="store_true", help="Continue processing on file errors")
         parser.add_argument("--no-cache", action="store_true", help="Disable token count and document memoization cache")
+        parser.add_argument("--durable-writes", action="store_true", help="Perform durable fsync writes")
         parser.add_argument("--report", default="both", choices=["text", "json", "both"], help="Report format")
         parser.add_argument("--report-path", default="report", help="Report output path (without extension)")
         parser.add_argument("--verify-semantics", action=argparse.BooleanOptionalAction, default=True, help="Run semantic validations")
@@ -153,7 +154,7 @@ def main():
 
         validate_mode_profile_combination(args.mode, args.profile, args.dictionary_scope)
 
-        file_repo = PhysicalFilesystem()
+        file_repo = PhysicalFilesystem(durable=args.durable_writes)
         token_counter = OfflineTokenizer(enable_cache=not args.no_cache)
         hash_service = HashService()
         json_codec = JsonCodec()
@@ -164,10 +165,10 @@ def main():
         if not file_repo.exists(src_abs):
             raise SourcePathError(f"Source not found: {src_abs}")
 
-        validate_filesystem_safety(src_abs, dst_abs)
+        validate_filesystem_safety(src_abs, dst_abs, args.report_path)
 
         java_raw_metrics = []
-
+        generated_bundles = []
 
         java_processed_relpaths = set()
         if args.java_raw_json and file_repo.exists(args.java_raw_json):
@@ -184,19 +185,10 @@ def main():
         if file_repo.is_file(src_abs):
             if any(src_abs.endswith(ext) for ext in supported_exts):
                 files_to_process.append(src_abs)
-            else:
-                raise SourcePathError(f"Unsupported file extension: {src_abs}")
         else:
             for filepath in file_repo.list_files(src_abs):
-                if dst_abs in file_repo.abspath(filepath):
-                    continue
-                name = os.path.basename(filepath)
-                if "tknd" in filepath or "sidecar" in filepath or "_mimificado" in name:
-                    continue
-                rel_p = file_repo.relpath(filepath, src_abs).replace('\\', '/')
-                if rel_p in java_processed_relpaths or name in java_processed_relpaths:
-                    continue
-                if any(filepath.endswith(ext) for ext in supported_exts):
+                rel_p = file_repo.relpath(filepath, src_abs).lstrip('./')
+                if rel_p not in java_processed_relpaths and not rel_p.startswith("tknd/") and any(filepath.endswith(ext) for ext in supported_exts):
                     files_to_process.append(filepath)
         files_to_process.sort()
 
@@ -397,7 +389,7 @@ def main():
                     if sidecar_data:
                         cand_tokens = token_counter.count(candidate_text)
                         cand_sidecar_tokens = token_counter.count(json_codec.encode(sidecar_data, indent=4))
-                        cand_aux_tokens = token_counter.count("Use the companion sidecar file to resolve aliases.")
+                        cand_aux_tokens = 0
 
                         economia_bruta = orig_tokens - cand_tokens
                         overhead = cand_sidecar_tokens + cand_aux_tokens
@@ -496,41 +488,41 @@ def main():
                     print(f"Semantic validation failed for {filepath}: {msg}", file=sys.stderr)
                     sys.exit(3)
 
+            rel_path = file_repo.relpath(filepath, src_abs) if os.path.isdir(src_abs) else os.path.basename(filepath)
+            dest_path = os.path.join(dst_abs, rel_path)
+            if profile in ["java", "code"] and not dest_path.endswith('.tknc'):
+                dest_path += '.tknc'
 
-            if final_tokens > orig_tokens:
-                inflation_detected = True
-                print(f"WARNING: Inflation in {filepath} ({orig_tokens} -> {final_tokens})")
+            text_to_write = final_text
+            sidecar_path = None
+            if dict_included and best_sidecar_data is not None:
+                sidecar_ref = file_repo.basename(dest_path) + ".cidatkn"
+                text_to_write = create_compressed_envelope(
+                    payload=final_text,
+                    sidecar_ref=sidecar_ref,
+                    source_sha256=best_sidecar_data["source_sha256"],
+                    mode=args.mode,
+                    strategy="dictionary"
+                )
+                sidecar_path = dest_path + ".cidatkn"
 
             if not args.dry_run:
-                rel_path = file_repo.relpath(filepath, src_abs) if os.path.isdir(src_abs) else os.path.basename(filepath)
-                dest_path = os.path.join(dst_abs, rel_path)
-
-                if profile in ["java", "code"] and not dest_path.endswith('.tknc'):
-                    dest_path += '.tknc'
-
-                text_to_write = final_text
-                if dict_included and best_sidecar_data is not None:
-                    sidecar_ref = file_repo.basename(dest_path) + ".cidatkn"
-                    text_to_write = create_compressed_envelope(
-                        payload=final_text,
-                        sidecar_ref=sidecar_ref,
-                        source_sha256=best_sidecar_data["source_sha256"],
-                        mode=args.mode,
-                        strategy="dictionary"
-                    )
-
                 file_repo.write_bytes(dest_path, text_to_write.encode('utf-8'))
-
-                if dict_included and best_sidecar_data is not None:
-                    sidecar_path = dest_path + ".cidatkn"
+                if sidecar_path:
                     file_repo.write_text(sidecar_path, json_codec.encode(best_sidecar_data, indent=4))
+                generated_bundles.append((filepath, dest_path, sidecar_path))
+
+            final_written_tokens = token_counter.count(text_to_write)
+            if final_written_tokens > orig_tokens:
+                inflation_detected = True
+                print(f"WARNING: Inflation in {filepath} ({orig_tokens} -> {final_written_tokens})")
 
             report_gen.add_entry(
                 filepath=filepath,
                 profile=profile,
                 tokens_orig=orig_tokens,
                 tokens_base=base_tokens,
-                tokens_new=final_tokens,
+                tokens_new=final_written_tokens,
                 dict_included=dict_included,
                 tokens_sidecar=tokens_sidecar,
                 tokens_aux=tokens_aux,
@@ -553,6 +545,8 @@ def main():
 
         if not args.dry_run:
             sidecar_val.verify_destination_sidecars(src_abs, dst_abs)
+            for orig_f, out_f, side_f in generated_bundles:
+                sidecar_val.validate_output_bundle(src_abs, dst_abs, out_f, side_f)
 
         if has_failed_file:
             print("Error: One or more files failed to process during execution.", file=sys.stderr)

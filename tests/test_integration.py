@@ -65,6 +65,7 @@ class TestPipelineIntegration(unittest.TestCase):
             "go", "run", "motor_v3.go",
             self.src_dir,
             self.dst_dir,
+            "--mode", "semantic",
             "--profile", "auto",
             "--dictionary-scope", "file",
             "--report", "both"

@@ -42,3 +42,40 @@ def test_cli_e2e_filesystem_safety_rejected(tmp_path):
     res = subprocess.run(cmd, capture_output=True, text=True)
     assert res.returncode == 4
     assert "Destination path cannot be identical to source path" in res.stderr
+
+def test_physical_filesystem_operations(tmp_path):
+    from cida.infrastructure.filesystem import PhysicalFilesystem, validate_filesystem_safety
+    from cida.domain.errors import EncodingValidationError
+
+    fs = PhysicalFilesystem(durable=True)
+
+    txt_file = str(tmp_path / "test.txt")
+    bin_file = str(tmp_path / "test.bin")
+
+    fs.write_text(txt_file, "Hello world", durable=True)
+    assert fs.exists(txt_file)
+    assert fs.is_file(txt_file)
+    assert fs.read_text(txt_file) == "Hello world\n" or fs.read_text(txt_file) == "Hello world"
+
+    fs.write_bytes(bin_file, b"Hello\x00world", durable=True)
+    assert fs.read_bytes(bin_file) == b"Hello\x00world"
+    assert fs.is_binary_file(bin_file)
+
+    files = fs.list_files(str(tmp_path))
+    assert len(files) >= 2
+
+    assert fs.list_dir(str(tmp_path / "nonexistent")) == []
+    assert len(fs.list_dir(str(tmp_path))) >= 2
+
+    fs.remove(txt_file)
+    assert not fs.exists(txt_file)
+
+    # Encoding error check
+    invalid_utf8 = str(tmp_path / "bad.txt")
+    fs.write_bytes(invalid_utf8, b"\x80\x81\x82")
+    with pytest.raises(EncodingValidationError):
+        fs.read_text(invalid_utf8)
+
+    # Report path safety check
+    with pytest.raises(SourcePathError):
+        validate_filesystem_safety(txt_file, str(tmp_path / "dst"), report_path=txt_file)

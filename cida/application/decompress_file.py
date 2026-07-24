@@ -38,6 +38,9 @@ class FileDecompressorUsecase:
             if sidecar_filepath is None and "sidecar_ref" in envelope_meta:
                 ref = envelope_meta["sidecar_ref"]
                 parent_dir = self.file_repo.dirname(compressed_filepath)
+                from cida.domain.sidecar import validate_sidecar_ref
+                validate_sidecar_ref(ref)
+
                 candidates = [
                     self.file_repo.join(parent_dir, ref),
                     self.file_repo.join(parent_dir, "sidecar", ref),
@@ -70,6 +73,10 @@ class FileDecompressorUsecase:
             raise SidecarValidationError(f"Failed to read/decode sidecar file '{sidecar_filepath}': {e}") from e
 
         validate_sidecar_schema(sidecar_data)
+
+        if envelope_meta:
+            from cida.domain.sidecar import reconcile_envelope_and_sidecar
+            reconcile_envelope_and_sidecar(envelope_meta, sidecar_data, sidecar_filepath)
 
         sidecar_source = sidecar_data.get("source")
         if not sidecar_source or not isinstance(sidecar_source, str):

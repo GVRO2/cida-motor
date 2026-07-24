@@ -221,6 +221,9 @@ func main() {
 	reportPath := ""
 	verifySemantics := true
 	dryRun := false
+	continueOnError := false
+	noCache := false
+	durableWrites := false
 
 	// Parse flags manually to preserve existing go run motor_v3.go <src> [dst] syntax
 	args := os.Args[1:]
@@ -234,8 +237,16 @@ func main() {
 			failOnInflation = true
 		} else if arg == "--verify-semantics" {
 			verifySemantics = true
+		} else if arg == "--no-verify-semantics" {
+			verifySemantics = false
 		} else if arg == "--dry-run" {
 			dryRun = true
+		} else if arg == "--continue-on-error" {
+			continueOnError = true
+		} else if arg == "--no-cache" {
+			noCache = true
+		} else if arg == "--durable-writes" {
+			durableWrites = true
 		} else if strings.HasPrefix(arg, "--mode=") {
 			mode = strings.TrimPrefix(arg, "--mode=")
 		} else if arg == "--mode" && i+1 < len(args) {
@@ -287,18 +298,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	if mode == "lossless" {
-		if profile == "code" || profile == "java" {
-			fmt.Println("❌ Lossless mode currently supports only Markdown and BMAD profiles. Use --mode semantic for code or Java inputs.")
-			os.Exit(1)
-		}
-		if dictScope == "corpus" {
-			fmt.Println("❌ Corpus dictionary is not currently supported in lossless mode. Use --dictionary-scope file or --mode semantic.")
-			os.Exit(1)
-		}
-	}
-
-
 	validReports := map[string]bool{"text": true, "json": true, "both": true}
 	if !validReports[reportFormat] {
 		fmt.Printf("❌ Erro: Formato de relatório inválido: %s\n", reportFormat)
@@ -316,9 +315,52 @@ func main() {
 	}
 
 	// Verify pastaOrig existence
-	if _, err := os.Stat(pastaOrig); os.IsNotExist(err) {
+	infoOrig, err := os.Stat(pastaOrig)
+	if os.IsNotExist(err) {
 		fmt.Printf("❌ Erro: Diretório ou arquivo de origem não encontrado: %s\n", pastaOrig)
 		os.Exit(4)
+	}
+
+	// Early pre-scan for profile resolution & lossless safety validation BEFORE ANY OUTPUT CREATION
+	effectiveProfile := profile
+	if profile == "auto" {
+		containsJavaOrCode := false
+		if !infoOrig.IsDir() {
+			ext := strings.ToLower(filepath.Ext(pastaOrig))
+			if ext == ".java" || isCodeExtension(ext) {
+				containsJavaOrCode = true
+			}
+		} else {
+			absOrig, _ := filepath.Abs(pastaOrig)
+			filepath.WalkDir(absOrig, func(path string, d os.DirEntry, err error) error {
+				if err != nil || d.IsDir() {
+					return nil
+				}
+				if isBinaryFileGo(path) {
+					return nil
+				}
+				ext := strings.ToLower(filepath.Ext(path))
+				if ext == ".java" || isCodeExtension(ext) {
+					containsJavaOrCode = true
+					return filepath.SkipAll
+				}
+				return nil
+			})
+		}
+		if containsJavaOrCode {
+			effectiveProfile = "code"
+		}
+	}
+
+	if mode == "lossless" {
+		if effectiveProfile == "code" || effectiveProfile == "java" || profile == "code" || profile == "java" {
+			fmt.Println("❌ Lossless mode currently supports only Markdown and BMAD profiles. Use --mode semantic for code or Java inputs.")
+			os.Exit(1)
+		}
+		if dictScope == "corpus" {
+			fmt.Println("❌ Corpus dictionary is not currently supported in lossless mode. Use --dictionary-scope file or --mode semantic.")
+			os.Exit(1)
+		}
 	}
 
 	if pastaComp == "" {
@@ -358,13 +400,59 @@ func main() {
 
 			if changed {
 				fmt.Println("🔄 Alteração detectada, recompilando...")
-				processarEComparar(pastaOrig, pastaComp, mode, profile, dictScope, failOnInflation, reportFormat, reportPath, verifySemantics, dryRun)
+				processarEComparar(pastaOrig, pastaComp, mode, profile, dictScope, failOnInflation, reportFormat, reportPath, verifySemantics, dryRun, continueOnError, noCache, durableWrites)
 			}
 			time.Sleep(2 * time.Second)
 		}
 	} else {
-		processarEComparar(pastaOrig, pastaComp, mode, profile, dictScope, failOnInflation, reportFormat, reportPath, verifySemantics, dryRun)
+		processarEComparar(pastaOrig, pastaComp, mode, profile, dictScope, failOnInflation, reportFormat, reportPath, verifySemantics, dryRun, continueOnError, noCache, durableWrites)
 	}
+}
+
+func isCodeExtension(ext string) bool {
+	codeExts := map[string]bool{
+		".go": true, ".py": true, ".js": true, ".ts": true, ".jsx": true, ".tsx": true,
+		".c": true, ".cpp": true, ".h": true, ".hpp": true, ".cs": true, ".java": true,
+		".kt": true, ".rs": true, ".rb": true, ".php": true, ".sh": true, ".ps1": true,
+		".json": true, ".yaml": true, ".yml": true, ".xml": true, ".html": true, ".css": true,
+	}
+	return codeExts[ext]
+}
+
+func writeAtomic(targetPath string, data []byte, durable bool) error {
+	dir := filepath.Dir(targetPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	tmpFile, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmpFile.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			tmpFile.Close()
+			os.Remove(tmpName)
+		}
+	}()
+
+	if _, err := tmpFile.Write(data); err != nil {
+		return err
+	}
+	if durable {
+		if err := tmpFile.Sync(); err != nil {
+			return err
+		}
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, targetPath); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
 }
 
 type JavaRawMetric struct {
@@ -378,7 +466,7 @@ type JavaRawMetric struct {
 	TokensAuxiliares int    `json:"tokens_auxiliares"`
 }
 
-func processarEComparar(pastaOrig string, pastaComp string, mode string, profile string, dictScope string, failOnInflation bool, reportFormat string, reportPath string, verifySemantics bool, dryRun bool) {
+func processarEComparar(pastaOrig string, pastaComp string, mode string, profile string, dictScope string, failOnInflation bool, reportFormat string, reportPath string, verifySemantics bool, dryRun bool, continueOnError bool, noCache bool, durableWrites bool) {
 	absOrig, _ := filepath.Abs(pastaOrig)
 	absComp, _ := filepath.Abs(pastaComp)
 
@@ -399,7 +487,7 @@ func processarEComparar(pastaOrig string, pastaComp string, mode string, profile
 	if _, err := os.Stat(absComp); (os.IsNotExist(err) || dirIsEmpty) && !dryRun {
 		fmt.Printf("📂 Criando pasta de destino: %s\n", absComp)
 		os.MkdirAll(absComp, 0755)
-		criarReadmeMinificado(absComp, absOrig)
+		criarReadmeMinificado(absComp, absOrig, durableWrites)
 	}
 
 	// 1. Scan files
@@ -505,7 +593,11 @@ func processarEComparar(pastaOrig string, pastaComp string, mode string, profile
 		
 		var sidecarTokensTotal int = 0
 		for _, sidecar := range sidecars {
-			sidecarBytes, _ := json.MarshalIndent(sidecar, "", "    ")
+			sidecarBytes, err := json.MarshalIndent(sidecar, "", "    ")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Erro ao serializar sidecar JSON: %v\n", err)
+				os.Exit(6)
+			}
 			toks, err := estimarTokens(string(sidecarBytes))
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "❌ Erro no tokenizer ao processar sidecar: %v\n", err)
@@ -563,9 +655,11 @@ func processarEComparar(pastaOrig string, pastaComp string, mode string, profile
 			}
 			
 			if !dryRun {
-				os.MkdirAll(filepath.Dir(info.destPath), 0755)
 				contentToSave := strings.ReplaceAll(finalContent, "\r\n", "\n")
-				os.WriteFile(info.destPath, []byte(contentToSave), 0644)
+				if err := writeAtomic(info.destPath, []byte(contentToSave), durableWrites); err != nil {
+					fmt.Fprintf(os.Stderr, "❌ Erro ao escrever %s: %v\n", info.destPath, err)
+					os.Exit(4)
+				}
 			}
 			
 			javaMetrics = append(javaMetrics, JavaRawMetric{
@@ -582,14 +676,20 @@ func processarEComparar(pastaOrig string, pastaComp string, mode string, profile
 		
 		if useDictionary && !dryRun {
 			tkndDir := filepath.Join(absComp, "tknd")
-			os.MkdirAll(tkndDir, 0755)
-			criarReadmeTknd(tkndDir)
+			criarReadmeTknd(tkndDir, durableWrites)
 			for startID, sidecar := range sidecars {
 				fileName := fmt.Sprintf("%s.cidatkn", startID)
-				fileBytes, _ := json.MarshalIndent(sidecar, "", "    ")
-				os.WriteFile(filepath.Join(tkndDir, fileName), fileBytes, 0644)
+				fileBytes, err := json.MarshalIndent(sidecar, "", "    ")
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "❌ Erro ao serializar sidecar JSON: %v\n", err)
+					os.Exit(6)
+				}
+				if err := writeAtomic(filepath.Join(tkndDir, fileName), fileBytes, durableWrites); err != nil {
+					fmt.Fprintf(os.Stderr, "❌ Erro ao escrever sidecar: %v\n", err)
+					os.Exit(4)
+				}
 			}
-			gerarScriptTraducao(absComp)
+			gerarScriptTraducao(absComp, durableWrites)
 		}
 		
 		if len(javaMetrics) > 0 {
@@ -599,12 +699,12 @@ func processarEComparar(pastaOrig string, pastaComp string, mode string, profile
 					tempDir, err := os.MkdirTemp("", "cida_dryrun_*")
 					if err == nil {
 						tempJavaJsonPath = filepath.Join(tempDir, ".cida_java_raw.json")
-						os.WriteFile(tempJavaJsonPath, javaMetricsJson, 0644)
+						writeAtomic(tempJavaJsonPath, javaMetricsJson, durableWrites)
 						defer os.RemoveAll(tempDir)
 					}
 				} else {
 					tempJavaJsonPath = filepath.Join(absComp, ".cida_java_raw.json")
-					os.WriteFile(tempJavaJsonPath, javaMetricsJson, 0644)
+					writeAtomic(tempJavaJsonPath, javaMetricsJson, durableWrites)
 				}
 			}
 		}
@@ -629,9 +729,20 @@ func processarEComparar(pastaOrig string, pastaComp string, mode string, profile
 		}
 		if verifySemantics {
 			pyArgs = append(pyArgs, "--verify-semantics")
+		} else {
+			pyArgs = append(pyArgs, "--no-verify-semantics")
 		}
 		if dryRun {
 			pyArgs = append(pyArgs, "--dry-run")
+		}
+		if continueOnError {
+			pyArgs = append(pyArgs, "--continue-on-error")
+		}
+		if noCache {
+			pyArgs = append(pyArgs, "--no-cache")
+		}
+		if durableWrites {
+			pyArgs = append(pyArgs, "--durable-writes")
 		}
 		// If Java files were processed, pass the raw json parameter
 		if _, err := os.Stat(filepath.Join(absComp, ".cida_java_raw.json")); err == nil {
@@ -659,14 +770,20 @@ func processarEComparar(pastaOrig string, pastaComp string, mode string, profile
 		for _, bf := range binaryFiles {
 			relPath, _ := filepath.Rel(absOrig, bf)
 			destPath := filepath.Join(absComp, relPath)
-			os.MkdirAll(filepath.Dir(destPath), 0755)
-			input, _ := os.ReadFile(bf)
-			os.WriteFile(destPath, input, 0644)
+			input, err := os.ReadFile(bf)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Erro ao ler arquivo binário %s: %v\n", bf, err)
+				os.Exit(4)
+			}
+			if err := writeAtomic(destPath, input, durableWrites); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ Erro ao escrever arquivo binário %s: %v\n", destPath, err)
+				os.Exit(4)
+			}
 		}
 	}
 }
 
-func criarReadmeMinificado(pastaDestino string, pastaOrigem string) {
+func criarReadmeMinificado(pastaDestino string, pastaOrigem string, durable bool) {
 	conteudo := `# ⚠️ PROJETO MINIFICADO - SOMENTE LEITURA
 
 Este diretório contém uma versão otimizada (minificada) do seu código, gerada automaticamente para reduzir drasticamente o consumo de tokens em modelos de linguagem (LLMs).
@@ -685,13 +802,13 @@ Este diretório contém uma versão otimizada (minificada) do seu código, gerad
 - Edição: As sugestões de código devem ser baseadas na estrutura da pasta original.
 `
 	
-	os.WriteFile(filepath.Join(pastaDestino, "README_MINIFICADO.md"), []byte(conteudo), 0644)
-	os.WriteFile(filepath.Join(pastaDestino, "CONSTITUTION.md"), []byte(getConstitutionContent()), 0644)
-	os.WriteFile(filepath.Join(pastaDestino, "AGENTS.md"), []byte(getAgentsContent()), 0644)
-	os.WriteFile(filepath.Join(pastaDestino, "PROMPT_INICIAL.MD"), []byte(getPromptInicialContent()), 0644)
+	writeAtomic(filepath.Join(pastaDestino, "README_MINIFICADO.md"), []byte(conteudo), durable)
+	writeAtomic(filepath.Join(pastaDestino, "CONSTITUTION.md"), []byte(getConstitutionContent()), durable)
+	writeAtomic(filepath.Join(pastaDestino, "AGENTS.md"), []byte(getAgentsContent()), durable)
+	writeAtomic(filepath.Join(pastaDestino, "PROMPT_INICIAL.MD"), []byte(getPromptInicialContent()), durable)
 }
 
-func criarReadmeTknd(pastaTknd string) {
+func criarReadmeTknd(pastaTknd string, durable bool) {
 	conteudo := `# Diretório de Dicionários de Tokens (tknd)
 
 Este diretório contém o mapeamento completo entre os identificadores ofuscados encontrados no código minificado e os seus nomes originais.
@@ -707,7 +824,7 @@ Sempre que encontrar um identificador ofuscado (ex: A5), procure no arquivo corr
 Para facilitar a tradução automática, utilize o script 'translate.py' disponível na raiz do projeto original passando os tokens como argumento.
 Exemplo: python3 translate.py A0 B1
 `
-	os.WriteFile(filepath.Join(pastaTknd, "README.md"), []byte(conteudo), 0644)
+	writeAtomic(filepath.Join(pastaTknd, "README.md"), []byte(conteudo), durable)
 }
 
 func getPromptInicialContent() string {
@@ -858,9 +975,9 @@ if __name__ == "__main__":
 `
 }
 
-func gerarScriptTraducao(pastaDestino string) {
+func gerarScriptTraducao(pastaDestino string, durable bool) {
 	conteudo := getTranslatePyContent()
-	os.WriteFile(filepath.Join(pastaDestino, "translate.py"), []byte(conteudo), 0755)
+	writeAtomic(filepath.Join(pastaDestino, "translate.py"), []byte(conteudo), durable)
 }
 
 func construirDicionario(pastaOrig string, javaFiles []string, corpusHash string) (map[string]string, map[string]SidecarData) {

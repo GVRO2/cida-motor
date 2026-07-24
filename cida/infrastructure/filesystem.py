@@ -1,9 +1,13 @@
 import os
+import tempfile
 import shutil
 from typing import List
 
 class PhysicalFilesystem:
     """Concrete implementation of filesystem repository."""
+
+    def __init__(self, durable: bool = False):
+        self.durable = durable
 
     def read_text(self, filepath: str, encoding: str = "utf-8") -> str:
         try:
@@ -19,14 +23,15 @@ class PhysicalFilesystem:
 
     def write_text(self, filepath: str, content: str, encoding: str = "utf-8", durable: bool = False) -> None:
         abs_path = os.path.abspath(filepath)
-        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        dir_name = os.path.dirname(abs_path)
+        os.makedirs(dir_name, exist_ok=True)
         content_lf = content.replace('\r\n', '\n')
-        tmp_path = f"{abs_path}.tmp.{os.getpid()}"
+        fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix=".tmp-")
         try:
-            with open(tmp_path, 'w', encoding=encoding, newline='\n') as f:
+            with os.fdopen(fd, 'w', encoding=encoding, newline='\n') as f:
                 f.write(content_lf)
                 f.flush()
-                if durable:
+                if durable or self.durable:
                     os.fsync(f.fileno())
             os.replace(tmp_path, abs_path)
         except Exception:
@@ -36,13 +41,14 @@ class PhysicalFilesystem:
 
     def write_bytes(self, filepath: str, content: bytes, durable: bool = False) -> None:
         abs_path = os.path.abspath(filepath)
-        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-        tmp_path = f"{abs_path}.tmp.{os.getpid()}"
+        dir_name = os.path.dirname(abs_path)
+        os.makedirs(dir_name, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix=".tmp-")
         try:
-            with open(tmp_path, 'wb') as f:
+            with os.fdopen(fd, 'wb') as f:
                 f.write(content)
                 f.flush()
-                if durable:
+                if durable or self.durable:
                     os.fsync(f.fileno())
             os.replace(tmp_path, abs_path)
         except Exception:
@@ -111,23 +117,33 @@ class PhysicalFilesystem:
         return os.listdir(path)
 
 
-def validate_filesystem_safety(source: str, destination: str) -> None:
+def validate_filesystem_safety(source: str, destination: str, report_path: str = "") -> None:
     from cida.domain.errors import SourcePathError
 
-    src_abs = os.path.abspath(source)
-    dst_abs = os.path.abspath(destination)
+    src_abs = os.path.normcase(os.path.realpath(os.path.abspath(source)))
+    dst_abs = os.path.normcase(os.path.realpath(os.path.abspath(destination)))
 
     if src_abs == dst_abs:
         raise SourcePathError(f"Destination path cannot be identical to source path: {src_abs}")
 
     try:
-        common = os.path.commonpath([src_abs, dst_abs])
+        common = os.path.normcase(os.path.commonpath([src_abs, dst_abs]))
     except ValueError:
-        return
+        common = ""
 
-    if common == src_abs:
+    if common and common == src_abs:
         raise SourcePathError(f"Destination directory cannot be nested inside source directory: {dst_abs} inside {src_abs}")
 
-    if common == dst_abs and os.path.isdir(dst_abs):
+    if common and common == dst_abs and os.path.isdir(dst_abs):
         raise SourcePathError(f"Source directory cannot be inside destination directory: {src_abs} inside {dst_abs}")
+
+    if report_path:
+        rep_abs = os.path.normcase(os.path.realpath(os.path.abspath(report_path)))
+        if rep_abs == src_abs:
+            raise SourcePathError(f"Report path cannot overwrite source input: {rep_abs}")
+        try:
+            if os.path.commonpath([src_abs, rep_abs]) == src_abs and os.path.isfile(src_abs):
+                raise SourcePathError(f"Report path cannot overwrite source file: {rep_abs}")
+        except ValueError:
+            pass
 

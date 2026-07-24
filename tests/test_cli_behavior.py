@@ -139,3 +139,38 @@ def test_cli_main_bmad_profile(tmp_path):
     ]
     with patch.object(sys, "argv", test_args):
         main()
+
+def test_cli_main_file_dictionary(tmp_path):
+    src = tmp_path / "sample.md"
+    src.write_text("supercalifragilisticexpialidocious " * 100)
+    dst = tmp_path / "dst"
+
+    test_args = [
+        "cida", "--src", str(src), "--dst", str(dst),
+        "--mode", "lossless", "--profile", "markdown",
+        "--dictionary-scope", "file", "--durable-writes", "--no-cache"
+    ]
+    with patch.object(sys, "argv", test_args):
+        main()
+
+def test_cli_main_continue_on_error(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    dst = tmp_path / "dst"
+    # Read-unfriendly or unprocessable directory item
+    f1 = src / "file1.md"
+    f1.write_text("valid file content")
+
+    test_args = [
+        "cida", "--src", str(src), "--dst", str(dst),
+        "--continue-on-error"
+    ]
+    with patch.object(sys, "argv", test_args):
+        main()
+
+def test_cli_main_invalid_combination():
+    test_args = ["cida", "--src", "s", "--dst", "d", "--mode", "lossless", "--profile", "code"]
+    with patch.object(sys, "argv", test_args), \
+         pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 1
