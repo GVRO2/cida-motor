@@ -678,7 +678,7 @@ def main():
                     file_repo.write_text(sidecar_path, json_codec.encode(best_sidecar_data, indent=4))
                 generated_bundles.append((filepath, dest_path, sidecar_path, content_bytes, out_bytes))
 
-            final_written_tokens = token_counter.count(text_to_write)
+            final_written_tokens = final_tokens if text_to_write == final_text else token_counter.count(text_to_write)
             if final_written_tokens > orig_tokens:
                 inflation_detected = True
                 print(f"WARNING: Inflation in {filepath} ({orig_tokens} -> {final_written_tokens})")
