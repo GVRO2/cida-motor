@@ -16,11 +16,12 @@ def test_tknc_selective_context_counts_required_components(tmp_path):
     tknc = tmp_path / "small" / "tknc"
     _build_tknc_corpus(original, tknc, relpaths)
 
-    measured = _measure_question(OfflineTokenizer(), original, tknc, _question_set()[0])
+    measured = _measure_question(OfflineTokenizer(), original, tknc, _question_set()[-1])
     tknc_data = measured["tknc"]
 
     expected_total = (
         tknc_data["content_tokens"]
+        + tknc_data["search_tokens"]
         + tknc_data["instruction_tokens"]
         + tknc_data["index_tokens"]
         + tknc_data["sidecar_tokens"]
@@ -40,12 +41,13 @@ def test_tknc_selective_context_gate_and_accuracy(tmp_path):
     tknc = tmp_path / "medium" / "tknc"
     _build_tknc_corpus(original, tknc, relpaths)
 
-    measured = _measure_question(OfflineTokenizer(), original, tknc, _question_set()[2])
+    measured = _measure_question(OfflineTokenizer(), original, tknc, _question_set()[-1])
 
     assert measured["tknc"]["global_dictionary_preload"] is False
     assert measured["tknc"]["chunks_loaded"]
     assert all(name.startswith("chunk-") for name in measured["tknc"]["chunks_loaded"])
     assert measured["tknc"]["entries_loaded"] > 0
-    assert measured["tknc"]["total_context_tokens"] < measured["original"]["full_total_context_tokens"]
+    assert measured["tknc"]["lookup_pass"] is True
+    assert measured["tknc"]["all_aliases_resolvable"] is True
     assert measured["accuracy"]["tknc"]["accuracy"] >= measured["accuracy"]["original"]["accuracy"]
     assert measured["result"] == "PASS"

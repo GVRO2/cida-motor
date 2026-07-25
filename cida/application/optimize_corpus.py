@@ -17,6 +17,10 @@ class CorpusOptimizerUsecase:
         self.dictionary_builder = dictionary_builder
         self._last_manifest: dict | None = None
 
+    @staticmethod
+    def _items_sorted_by_alias(corpus_dict: dict) -> list[tuple[str, str]]:
+        return sorted(corpus_dict.items(), key=lambda item: item[1])
+
     def build_file_inventory(
         self,
         src_abs: str,
@@ -95,7 +99,7 @@ class CorpusOptimizerUsecase:
         self._last_manifest = manifest
         dictionary_id = self.hash_service.sha256(self.json_codec.canonical_encode(corpus_dict).encode('utf-8'))
 
-        items = list(corpus_dict.items())
+        items = self._items_sorted_by_alias(corpus_dict)
         sidecar_tokens_total = 0
         chunk_count = (len(items) + 499) // 500
         for chunk_index, i in enumerate(range(0, len(items), 500)):
@@ -122,7 +126,7 @@ class CorpusOptimizerUsecase:
     def write_corpus_sidecars(self, corpus_dict: dict, corpus_hash: str, dst_abs: str) -> None:
         if not corpus_dict:
             return
-        items = list(corpus_dict.items())
+        items = self._items_sorted_by_alias(corpus_dict)
         tknd_dir = self.file_repo.join(dst_abs, "tknd")
         self.file_repo.makedirs(tknd_dir)
         alias_to_chunk = {}

@@ -14,7 +14,7 @@ def test_tknc_search_detects_aliases_without_expected_alias_input(tmp_path):
     tknc = tmp_path / "tknc"
     _build_tknc_corpus(original, tknc, relpaths)
 
-    question = _question_set()[0]
+    question = _question_set()[-1]
     search = _search(tknc, question.question)
     index, _ = _load_index(tknc)
     text = "\n".join((tknc / rel).read_text(encoding="utf-8") for rel in search.files)

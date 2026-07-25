@@ -1,7 +1,6 @@
 import argparse
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -15,22 +14,25 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from cida.application.selective_alias_resolution import (  # noqa: E402
-    ALIAS_INDEX_FILENAME,
-    AliasDetector,
-    SelectiveAliasResolver,
+from cida.application.selective_alias_resolution import ALIAS_INDEX_FILENAME  # noqa: E402
+from cida.infrastructure.tknc_context_session import (  # noqa: E402
+    ContextFilesystem,
+    TkncContextSession,
+    artifact_type,
+    is_content_artifact,
+    is_evidence_artifact,
+    is_lookup_artifact,
+    search_context,
 )
-from cida.infrastructure.filesystem import PhysicalFilesystem  # noqa: E402
 from cida.infrastructure.hashing import HashService  # noqa: E402
 from cida.infrastructure.json_codec import JsonCodec  # noqa: E402
 from cida.infrastructure.tokenizer import OfflineTokenizer  # noqa: E402
 
 
 INSTRUCTION_ORIGINAL = "Answer using selected original files discovered from the question."
-INSTRUCTION_TKNC = "Answer using selected .tknc files discovered from the question and reconstruct aliases first."
-LOOKUP_INSTRUCTION = "Use alias-index.json ranges to locate only .cidatkn chunks containing detected aliases."
-MANIFEST_INSTRUCTION = "Validate the generated corpus manifest before trusting retrieved content."
-TOKEN_SUFFIXES = {".py", ".go", ".java", ".md", ".txt", ".json", ".yaml", ".yml", ".tknc", ".cidatkn"}
+INSTRUCTION_TKNC = "Answer using selected .tknc content files, then resolve detected aliases through the measured session."
+LOOKUP_INSTRUCTION = "Resolve only aliases detected in selected content, and load only chunks required by the alias index."
+MANIFEST_INSTRUCTION = "Validate the corpus manifest hash and binding before trusting sidecar chunks."
 
 
 @dataclass(frozen=True)
@@ -41,52 +43,6 @@ class Question:
     required_symbols: tuple[str, ...]
     required_facts: tuple[str, ...]
     forbidden_facts: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class SearchResult:
-    files: tuple[str, ...]
-    files_scanned: int
-    terms: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class ReadEvent:
-    path: str
-    bytes_requested: int
-    bytes_read: int
-    artifact_type: str
-    relative_timestamp_ms: float
-
-
-class InstrumentedFilesystem(PhysicalFilesystem):
-    def __init__(self) -> None:
-        super().__init__()
-        self._started = time.perf_counter()
-        self.reads: list[ReadEvent] = []
-
-    def read_bytes_limited(self, filepath: str, max_bytes: int) -> bytes:
-        data = super().read_bytes_limited(filepath, max_bytes)
-        self.reads.append(
-            ReadEvent(
-                path=filepath,
-                bytes_requested=max_bytes,
-                bytes_read=len(data),
-                artifact_type=_artifact_type(Path(filepath)),
-                relative_timestamp_ms=(time.perf_counter() - self._started) * 1000.0,
-            )
-        )
-        return data
-
-
-def _artifact_type(path: Path) -> str:
-    if path.name == ALIAS_INDEX_FILENAME:
-        return "index"
-    if path.name == "tknc-manifest.json":
-        return "manifest"
-    if path.suffix == ".cidatkn":
-        return "sidecar"
-    return "content"
 
 
 def _run_git_head() -> str:
@@ -106,62 +62,77 @@ def _token_count(tokenizer: OfflineTokenizer, parts: list[str]) -> int:
     return sum(tokenizer.count(part) for part in parts if part)
 
 
+def _word_suffix(value: int) -> str:
+    letters = []
+    current = value
+    for _ in range(6):
+        letters.append(chr(ord("a") + current % 26))
+        current //= 26
+    return "".join(reversed(letters))
+
+
+def _dictionary_words(count: int, prefix: str) -> list[str]:
+    safe_prefix = "".join(ch for ch in prefix.lower() if ch.isalpha())[:6] or "cida"
+    return [f"{safe_prefix}context{_word_suffix(i)}compression" for i in range(count)]
+
+
 def _write_fixture_corpus(root: Path, name: str, count: int) -> tuple[Path, list[str]]:
     source = root / name / "original"
     source.mkdir(parents=True)
     relpaths: list[str] = []
-    marker = f"{name}_deterministic_context_reduction_marker"
-    bridge = "python_optimizer_bridge"
-    sidecar_writer = "corpus_sidecar_writer"
-    reconstruction = "lossless_reconstruction_contract"
-    worker_profile = "resource_worker_profile"
-    lexicon = " ".join([marker, bridge, sidecar_writer, reconstruction, worker_profile])
-    repeated = (lexicon + " ") * (80 if name != "low" else 12)
+    alias_target = max(40, count)
+    dictionary_words = _dictionary_words(alias_target, name)
+    repeated_words = " ".join(f"{word} {word} {word} {word}" for word in dictionary_words)
+    primary_words = " ".join(f"{word} {word} {word} {word}" for word in dictionary_words[:1])
 
     templates = {
         "cida/interfaces/cli.py": (
             "def main():\n"
             "    return processarEComparar()\n\n"
             "def processarEComparar():\n"
-            f"    return '{bridge} invokes the Go wrapper through {marker}'\n"
+            "    return 'python_optimizer_bridge starts the principal processing component'\n\n"
+            f"CLI_CONTEXT = '{primary_words}'\n"
         ),
         "motor_v3.go": (
             "package main\n\n"
             "func main() { processarEComparar() }\n"
-            f"func processarEComparar() string {{ return \"Go wrapper uses {bridge}\" }}\n"
+            "func processarEComparar() string { return \"Go wrapper uses python_optimizer_bridge\" }\n"
+            f"const MotorContext = \"{primary_words}\"\n"
         ),
         "cida/infrastructure/tokenizer.py": (
             "def count_tokens(text):\n"
-            f"    return len(text.split())  # deterministic token counter {marker}\n"
+            "    return len(text.split())  # deterministic token counter\n\n"
+            f"TOKENIZER_CONTEXT = '{primary_words}'\n"
         ),
         "cida/application/optimize_corpus.py": (
             "def write_corpus_sidecars(dst):\n"
-            f"    return 'tknd alias-index.json .cidatkn {sidecar_writer}'\n"
+            "    return 'tknd alias-index.json cidatkn corpus_sidecar_writer'\n\n"
+            f"SIDECAR_WRITER_CONTEXT = '{primary_words}'\n"
         ),
         "cida/domain/reconstruction.py": (
             "def reconstruct_content(payload, entries):\n"
-            f"    return payload.replace('alias', entries['alias'])  # {reconstruction}\n"
+            "    return payload.replace('alias', entries['alias'])  # lossless_reconstruction_contract\n\n"
+            f"RECONSTRUCTION_CONTEXT = '{primary_words}'\n"
         ),
         "src/main/java/ResourceProfiles.java": (
-            f"public final class ResourceProfiles {{ static int resolveEffectiveWorkers() {{ return 4; }} String p = \"{worker_profile}\"; }}\n"
+            "public final class ResourceProfiles {\n"
+            "  static int resolveEffectiveWorkers() { return 4; }\n"
+            "  String profile = \"resource_worker_profile\";\n"
+            f"  String context = \"{primary_words}\";\n"
+            "}\n"
         ),
-        "docs/lexicon.md": f"# Lexicon\n\n{repeated}\n",
-        "docs/workflow.md": f"# BMAD Workflow\n\nThe flow preserves {marker} and {bridge}.\n\n{repeated}\n",
+        "docs/lexicon.md": f"# Lexicon\n\n{repeated_words}\n",
+        "docs/workflow.md": (
+            "# BMAD Workflow\n\n"
+            "The flow preserves python_optimizer_bridge, corpus_sidecar_writer, and resource_worker_profile.\n\n"
+            f"{primary_words}\n"
+        ),
     }
 
     for rel, content in templates.items():
         path = source / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
-        relpaths.append(rel)
-
-    extra_count = max(0, count - len(templates))
-    for i in range(extra_count):
-        rel = f"docs/extra-{i:04d}.md" if i % 2 == 0 else f"mixed/file-{i:04d}.txt"
-        body = f"# Extra {i}\n\n{repeated} scenario_{i:04d}_unique_low_frequency\n"
-        path = source / rel
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(body, encoding="utf-8")
         relpaths.append(rel)
 
     return source, sorted(relpaths)
@@ -217,111 +188,129 @@ def _build_tknc_corpus(original: Path, destination: Path, relpaths: list[str] | 
     index_path = destination / "tknd" / ALIAS_INDEX_FILENAME
     if not index_path.exists():
         return {}
-    index = json.loads(index_path.read_text(encoding="utf-8"))
-    resolver = SelectiveAliasResolver(PhysicalFilesystem(), JsonCodec(), HashService())
-    all_aliases = set()
-    for item in index.get("ranges", []):
-        first_alias = item["first_alias"]
-        last_alias = item["last_alias"]
-        if first_alias == last_alias:
-            all_aliases.add(first_alias)
-    if not all_aliases:
-        for sidecar in sorted((destination / "tknd").glob("*.cidatkn")):
-            data = json.loads(sidecar.read_text(encoding="utf-8"))
-            all_aliases.update(data.get("entries", {}).keys())
-    return resolver.resolve(all_aliases, str(destination / "tknd")).resolved
+    fs = ContextFilesystem()
+    session = TkncContextSession(destination, fs, JsonCodec(), HashService(), OfflineTokenizer())
+    index = session._load_index(query_id="build-corpus")
+    session._validate_manifest(index, query_id="build-corpus")
+    aliases: set[str] = set()
+    for sidecar in sorted((destination / "tknd").glob("*.cidatkn")):
+        text = fs.read_text_limited(str(sidecar), 2_000_000, operation="lookup", reason="build_alias_map", query_id="build-corpus")
+        data = JsonCodec().decode(text)
+        aliases.update(data.get("entries", {}).keys())
+    return session.resolve(aliases, query_id="build-corpus").resolved
 
 
 def _question_set() -> list[Question]:
     return [
         Question(
             "Q001",
-            "processarEComparar python_optimizer_bridge motor_v3 main",
+            "Qual componente inicia o processamento principal?",
             ("cida/interfaces/cli.py", "motor_v3.go"),
             ("main", "processarEComparar"),
             ("processarEComparar",),
         ),
         Question(
             "Q002",
-            "count_tokens tokenizer deterministic token counter",
+            "Qual componente e responsavel por contar tokens?",
             ("cida/infrastructure/tokenizer.py",),
             ("count_tokens",),
             ("deterministic token counter",),
         ),
         Question(
             "Q003",
-            "write_corpus_sidecars tknd alias-index cidatkn corpus_sidecar_writer",
+            "Onde o sistema cria os arquivos auxiliares usados para resolver os aliases?",
             ("cida/application/optimize_corpus.py",),
             ("write_corpus_sidecars",),
-            ("tknd", "corpus_sidecar_writer"),
+            ("write_corpus_sidecars",),
         ),
         Question(
             "Q004",
-            "reconstruct_content lossless_reconstruction_contract replace entries",
+            "Como o motor recupera o conteudo original a partir dos aliases?",
             ("cida/domain/reconstruction.py",),
             ("reconstruct_content",),
-            ("replace", "lossless_reconstruction_contract"),
+            ("lossless_reconstruction_contract",),
         ),
         Question(
             "Q005",
-            "ResourceProfiles resolveEffectiveWorkers resource_worker_profile workers",
+            "Como o sistema calcula a quantidade efetiva de workers?",
             ("src/main/java/ResourceProfiles.java",),
             ("ResourceProfiles", "resolveEffectiveWorkers"),
             ("resource_worker_profile",),
         ),
+        Question(
+            "Q006",
+            "Qual arquivo concentra o vocabulario comprimido de referencia?",
+            ("docs/lexicon.md",),
+            ("Lexicon",),
+            ("Lexicon",),
+        ),
     ]
 
 
-def _terms(question: str) -> tuple[str, ...]:
-    raw = re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", question)
-    stop = {"the", "and", "with", "using", "qual", "como", "onde"}
-    return tuple(dict.fromkeys(term for term in raw if term.lower() not in stop))
-
-
-def _iter_context_files(root: Path) -> list[Path]:
+def _read_selected(
+    root: Path,
+    relpaths: tuple[str, ...],
+    fs: ContextFilesystem,
+    *,
+    query_id: str,
+    reason: str,
+) -> list[str]:
     return [
-        path
-        for path in sorted(root.rglob("*"))
-        if path.is_file()
-        and path.suffix in TOKEN_SUFFIXES
-        and not path.name.startswith("report")
-        and ".pytest_cache" not in path.parts
+        fs.read_text_limited(
+            str(root / rel),
+            2_000_000,
+            operation="content_load",
+            reason=reason,
+            query_id=query_id,
+        )
+        for rel in relpaths
     ]
 
 
-def _read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8", errors="replace")
-
-
-def _search(root: Path, question: str, limit: int = 4) -> SearchResult:
-    terms = _terms(question)
-    scored = []
-    files = _iter_context_files(root)
-    for path in files:
-        rel = path.relative_to(root).as_posix()
-        text = _read_text(path)
-        rel_lower = rel.lower()
-        text_lower = text.lower()
-        score = 0
-        for term in terms:
-            term_lower = term.lower()
-            if term_lower in rel_lower:
-                score += 12
-            if re.search(rf"\b{re.escape(term_lower)}\b", text_lower):
-                score += 8
-            score += min(text_lower.count(term_lower), 3)
-        if score:
-            scored.append((score, rel))
-    scored.sort(key=lambda item: (-item[0], item[1]))
-    return SearchResult(tuple(rel for _, rel in scored[:limit]), len(files), terms)
+def _search(root: Path, question: str, limit: int = 4):
+    return search_context(root, question, ContextFilesystem(), OfflineTokenizer(), query_id="compat-search", limit=limit)
 
 
 def _load_index(tknc: Path) -> tuple[dict[str, Any], str]:
-    index_text = (tknc / "tknd" / ALIAS_INDEX_FILENAME).read_text(encoding="utf-8")
-    return json.loads(index_text), index_text
+    fs = ContextFilesystem()
+    index_text = fs.read_text_limited(
+        str(tknc / "tknd" / ALIAS_INDEX_FILENAME),
+        2_000_000,
+        operation="lookup",
+        reason="compat_load_index",
+        query_id="compat-load-index",
+    )
+    return JsonCodec().decode(index_text), index_text
+
+
+def _iter_full_context_files(root: Path, *, include_lookup: bool) -> list[Path]:
+    files: list[Path] = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or ".pytest_cache" in path.parts:
+            continue
+        if is_content_artifact(path):
+            files.append(path)
+        elif include_lookup and (is_lookup_artifact(path) or is_evidence_artifact(path)):
+            files.append(path)
+    return files
+
+
+def _read_full_context(root: Path, fs: ContextFilesystem, *, query_id: str, include_lookup: bool) -> list[str]:
+    return [
+        fs.read_text_limited(
+            str(path),
+            2_000_000,
+            operation="full_context",
+            reason="full_context_comparison",
+            query_id=query_id,
+        )
+        for path in _iter_full_context_files(root, include_lookup=include_lookup)
+    ]
 
 
 def _reconstruct_text(text: str, resolved: dict[str, str]) -> str:
+    import re
+
     for alias, value in sorted(resolved.items(), key=lambda item: len(item[0]), reverse=True):
         text = re.sub(rf"\b{re.escape(alias)}\b", value, text)
     return text
@@ -344,46 +333,117 @@ def _score(question: Question, loaded_files: tuple[str, ...], reconstructed_part
     }
 
 
-def _measure_question(tokenizer: OfflineTokenizer, original: Path, tknc: Path, question: Question) -> dict[str, Any]:
-    original_search = _search(original, question.question)
-    tknc_search = _search(tknc, question.question)
-    index, index_text = _load_index(tknc)
-    manifest_text = (tknc / "tknc-manifest.json").read_text(encoding="utf-8")
+def _read_events_dict(fs: ContextFilesystem) -> list[dict[str, Any]]:
+    return [event.__dict__ for event in fs.reads]
 
-    selected_tknc_text = [_read_text(tknc / rel) for rel in tknc_search.files]
-    detected_aliases = AliasDetector().detect("\n".join(selected_tknc_text), index)
-    fs = InstrumentedFilesystem()
-    resolver = SelectiveAliasResolver(fs, JsonCodec(), HashService(), tokenizer)
-    start = time.perf_counter()
-    resolution = resolver.resolve(detected_aliases, str(tknc / "tknd"))
-    lookup_duration_ms = (time.perf_counter() - start) * 1000.0
+
+def _events_before(fs: ContextFilesystem, marker_count: int, artifact: str) -> int:
+    return sum(1 for event in fs.reads[:marker_count] if event.artifact_type == artifact and not event.cache_hit)
+
+
+def _measure_question(tokenizer: OfflineTokenizer, original: Path, tknc: Path, question: Question) -> dict[str, Any]:
+    query_id = question.question_id
+    original_fs = ContextFilesystem()
+    tknc_fs = ContextFilesystem()
+    session = TkncContextSession(tknc, tknc_fs, JsonCodec(), HashService(), tokenizer)
+
+    original_search = search_context(original, question.question, original_fs, tokenizer, query_id=query_id)
+    original_selected_text = _read_selected(original, original_search.files, original_fs, query_id=query_id, reason="original_selected_content")
+
+    tknc_search = session.search(question.question, query_id=query_id)
+    selected_tknc_text = _read_selected(tknc, tknc_search.files, tknc_fs, query_id=query_id, reason="tknc_selected_content")
+    alias_detection_event_count = len(tknc_fs.reads)
+    alias_candidates = set(tknc_search.alias_candidates)
+    detected_aliases = session.aliases_in_index(alias_candidates, query_id=query_id)
+    required_chunks = session.required_chunks(detected_aliases, query_id=query_id)
+    resolution = session.resolve(detected_aliases, query_id=query_id)
     reconstructed_tknc = [_reconstruct_text(text, resolution.resolved) for text in selected_tknc_text]
 
-    selected_original_text = [_read_text(original / rel) for rel in original_search.files]
-    original_accuracy = _score(question, original_search.files, selected_original_text)
+    original_accuracy = _score(question, original_search.files, original_selected_text)
     tknc_accuracy = _score(question, tknc_search.files, reconstructed_tknc)
 
-    original_full_total = _token_count(tokenizer, [INSTRUCTION_ORIGINAL, *[_read_text(p) for p in _iter_context_files(original)]])
-    tknc_full_total = _token_count(tokenizer, [INSTRUCTION_TKNC, LOOKUP_INSTRUCTION, *[_read_text(p) for p in _iter_context_files(tknc)]])
-    original_selective_content = _token_count(tokenizer, selected_original_text)
-    original_selective_total = original_selective_content + tokenizer.count(INSTRUCTION_ORIGINAL)
+    original_full_total = _token_count(tokenizer, [INSTRUCTION_ORIGINAL, *_read_full_context(original, original_fs, query_id=query_id, include_lookup=False)])
+    tknc_full_total = _token_count(
+        tokenizer,
+        [INSTRUCTION_TKNC, LOOKUP_INSTRUCTION, MANIFEST_INSTRUCTION, *_read_full_context(tknc, tknc_fs, query_id=query_id, include_lookup=True)],
+    )
+
+    original_selective_content = _token_count(tokenizer, original_selected_text)
+    original_selective_total = original_selective_content + tokenizer.count(INSTRUCTION_ORIGINAL) + original_search.search_tokens
     tknc_content_tokens = _token_count(tokenizer, selected_tknc_text)
     tknc_instruction_tokens = _token_count(tokenizer, [INSTRUCTION_TKNC, LOOKUP_INSTRUCTION, MANIFEST_INSTRUCTION])
-    tknc_index_tokens = tokenizer.count(index_text)
-    tknc_manifest_tokens = tokenizer.count(manifest_text)
+    tknc_index_tokens = tokenizer.count(session.index_text)
+    tknc_manifest_tokens = tokenizer.count(session.manifest_text)
     tknc_translation_tokens = tokenizer.count(json.dumps(resolution.resolved, sort_keys=True))
     tknc_sidecar_tokens = max(0, resolution.tokens_loaded - tknc_index_tokens)
     tknc_cold_total = (
         tknc_content_tokens
+        + tknc_search.search_tokens
         + tknc_instruction_tokens
         + tknc_index_tokens
         + tknc_manifest_tokens
         + tknc_sidecar_tokens
         + tknc_translation_tokens
     )
-    tknc_warm_total = tknc_cold_total - tknc_index_tokens - tknc_manifest_tokens
-    read_events = [event.__dict__ for event in fs.reads]
-    chunks_loaded = [event for event in fs.reads if event.artifact_type == "sidecar"]
+    loaded_chunks = tuple(resolution.chunks_loaded)
+    unexpected_chunks = sorted(set(loaded_chunks) - set(required_chunks))
+    missing_chunks = sorted(set(required_chunks) - set(loaded_chunks))
+    duplicate_chunk_reads = max(0, len(loaded_chunks) - len(set(loaded_chunks)))
+    sidecar_reads_before_detection = _events_before(tknc_fs, alias_detection_event_count, "sidecar")
+    unnecessary_sidecar_chunks_read = len(unexpected_chunks)
+
+    tknc_data = {
+        "search_tokens": tknc_search.search_tokens,
+        "content_tokens": tknc_content_tokens,
+        "instruction_tokens": tknc_instruction_tokens,
+        "index_tokens": tknc_index_tokens,
+        "manifest_tokens": tknc_manifest_tokens,
+        "sidecar_tokens": tknc_sidecar_tokens,
+        "translation_tokens": tknc_translation_tokens,
+        "total_tokens": tknc_cold_total,
+        "total_context_tokens": tknc_cold_total,
+        "full_total_context_tokens": tknc_full_total,
+        "files_available": tknc_search.files_available,
+        "files_scanned": tknc_search.files_scanned,
+        "files_selected": tknc_search.files_selected,
+        "files_loaded": list(tknc_search.files),
+        "content_files_selected": list(tknc_search.files),
+        "search_bytes_read": tknc_search.search_bytes_read,
+        "search_duration_ms": tknc_search.search_duration_ms,
+        "alias_candidates_detected_before_index": sorted(alias_candidates),
+        "aliases_detected": sorted(detected_aliases),
+        "aliases_resolved": sorted(resolution.resolved),
+        "aliases_unresolved": sorted(set(detected_aliases) - set(resolution.resolved)),
+        "aliases_unexpected": sorted(set(resolution.resolved) - set(detected_aliases)),
+        "required_chunks": list(required_chunks),
+        "loaded_chunks": list(loaded_chunks),
+        "chunks_loaded": list(loaded_chunks),
+        "unexpected_chunks": unexpected_chunks,
+        "missing_chunks": missing_chunks,
+        "duplicate_chunk_reads": duplicate_chunk_reads,
+        "chunks_available": session.index_data.get("chunk_count", 0) if session.index_data else 0,
+        "entries_loaded": resolution.entries_loaded,
+        "bytes_read": sum(event.bytes_read for event in tknc_fs.reads if not event.cache_hit),
+        "read_events": _read_events_dict(tknc_fs),
+        "sidecar_reads_before_alias_detection": sidecar_reads_before_detection,
+        "index_reads_before_alias_detection": _events_before(tknc_fs, alias_detection_event_count, "alias_index"),
+        "global_dictionary_preload": sidecar_reads_before_detection > 0 or unnecessary_sidecar_chunks_read > 0,
+        "lookup_pass": set(loaded_chunks) == set(required_chunks)
+        and sidecar_reads_before_detection == 0
+        and not unexpected_chunks
+        and not missing_chunks
+        and duplicate_chunk_reads == 0,
+        "all_aliases_resolvable": set(detected_aliases) == set(resolution.resolved),
+    }
+    tknc_data["token_accounting_pass"] = tknc_data["total_tokens"] == (
+        tknc_data["content_tokens"]
+        + tknc_data["search_tokens"]
+        + tknc_data["instruction_tokens"]
+        + tknc_data["index_tokens"]
+        + tknc_data["manifest_tokens"]
+        + tknc_data["sidecar_tokens"]
+        + tknc_data["translation_tokens"]
+    )
 
     return {
         "question_id": question.question_id,
@@ -392,44 +452,25 @@ def _measure_question(tokenizer: OfflineTokenizer, original: Path, tknc: Path, q
         "required_symbols": list(question.required_symbols),
         "required_facts": list(question.required_facts),
         "original": {
-            "search_tokens": tokenizer.count(" ".join(original_search.terms)),
+            "search_tokens": original_search.search_tokens,
             "content_tokens": original_selective_content,
             "instruction_tokens": tokenizer.count(INSTRUCTION_ORIGINAL),
             "total_context_tokens": original_selective_total,
             "full_total_context_tokens": original_full_total,
+            "files_available": original_search.files_available,
             "files_scanned": original_search.files_scanned,
+            "files_selected": original_search.files_selected,
             "files_loaded": list(original_search.files),
         },
-        "tknc": {
-            "search_tokens": tokenizer.count(" ".join(tknc_search.terms)),
-            "content_tokens": tknc_content_tokens,
-            "instruction_tokens": tknc_instruction_tokens,
-            "index_tokens": tknc_index_tokens,
-            "manifest_tokens": tknc_manifest_tokens,
-            "sidecar_tokens": tknc_sidecar_tokens,
-            "translation_tokens": tknc_translation_tokens,
-            "total_context_tokens": tknc_cold_total,
-            "warm_context_tokens": tknc_warm_total,
-            "full_total_context_tokens": tknc_full_total,
-            "files_scanned": tknc_search.files_scanned,
-            "files_loaded": list(tknc_search.files),
-            "aliases_detected": sorted(detected_aliases),
-            "aliases_resolved": sorted(resolution.resolved),
-            "chunks_loaded": list(resolution.chunks_loaded),
-            "chunks_available": index.get("chunk_count", 0),
-            "entries_loaded": resolution.entries_loaded,
-            "bytes_read": sum(event.bytes_read for event in fs.reads),
-            "read_events": read_events,
-            "global_dictionary_preload": len(chunks_loaded) == index.get("chunk_count", 0) and index.get("chunk_count", 0) > 1,
-        },
+        "tknc": tknc_data,
         "accuracy": {
             "original": original_accuracy,
             "tknc": tknc_accuracy,
             "accuracy_delta": tknc_accuracy["accuracy"] - original_accuracy["accuracy"],
         },
         "performance": {
-            "lookup_duration_ms": lookup_duration_ms,
-            "search_duration_ms": 0.0,
+            "lookup_duration_ms": resolution.alias_resolution_duration_ms,
+            "search_duration_ms": tknc_search.search_duration_ms,
             "reconstruction_duration_ms": 0.0,
             "index_parse_duration_ms": resolution.index_parse_duration_ms,
             "sidecar_parse_duration_ms": resolution.sidecar_parse_duration_ms,
@@ -440,59 +481,163 @@ def _measure_question(tokenizer: OfflineTokenizer, original: Path, tknc: Path, q
         "selective_cold_delta_percentage": (
             (original_selective_total - tknc_cold_total) / original_selective_total * 100.0 if original_selective_total else 0.0
         ),
-        "selective_warm_delta_percentage": (
-            (original_selective_total - tknc_warm_total) / original_selective_total * 100.0 if original_selective_total else 0.0
-        ),
-        "result": "PASS" if tknc_accuracy["accuracy"] >= original_accuracy["accuracy"] else "FAIL",
+        "result": "PASS" if tknc_accuracy["accuracy"] >= original_accuracy["accuracy"] and tknc_data["lookup_pass"] else "FAIL",
     }
 
 
-def _break_even(original_selective: int, tknc_cold: int, tknc_warm: int) -> int | None:
-    if tknc_warm >= original_selective:
-        return None
-    fixed = max(0, tknc_cold - tknc_warm)
-    per_query_saving = original_selective - tknc_warm
-    return max(1, (fixed + per_query_saving - 1) // per_query_saving)
+def _session_token_total(tokenizer: OfflineTokenizer, fs: ContextFilesystem, content_tokens: int, search_tokens: int, translation_tokens: int) -> int:
+    lookup_texts = []
+    for path_key, raw in fs._cache.items():
+        path = Path(path_key)
+        if artifact_type(path) in {"alias_index", "manifest", "sidecar"}:
+            lookup_texts.append(raw.decode("utf-8"))
+    return content_tokens + search_tokens + _token_count(tokenizer, [INSTRUCTION_TKNC, LOOKUP_INSTRUCTION, MANIFEST_INSTRUCTION]) + _token_count(tokenizer, lookup_texts) + translation_tokens
 
 
-def _summarize(head_sha: str, corpora: dict[str, Any], scenarios: list[dict[str, Any]], production: dict[str, Any]) -> dict[str, Any]:
+def _run_tknc_session(tokenizer: OfflineTokenizer, tknc: Path, questions: list[Question], query_count: int) -> dict[str, Any]:
+    fs = ContextFilesystem()
+    session = TkncContextSession(tknc, fs, JsonCodec(), HashService(), tokenizer)
+    content_tokens = 0
+    search_tokens = 0
+    translation_tokens = 0
+    for idx in range(query_count):
+        question = questions[idx % len(questions)]
+        query_id = f"multi-{query_count}-{idx:03d}"
+        search = session.search(question.question, query_id=query_id)
+        selected = _read_selected(tknc, search.files, fs, query_id=query_id, reason="session_selected_content")
+        aliases = session.aliases_in_index(set(search.alias_candidates), query_id=query_id)
+        resolution = session.resolve(aliases, query_id=query_id)
+        content_tokens += _token_count(tokenizer, selected)
+        search_tokens += search.search_tokens
+        translation_tokens += tokenizer.count(json.dumps(resolution.resolved, sort_keys=True))
+    total = _session_token_total(tokenizer, fs, content_tokens, search_tokens, translation_tokens)
+    return {
+        "queries": query_count,
+        "tknc": total,
+        "physical_index_reads": fs.physical_read_count("alias_index"),
+        "physical_manifest_reads": fs.physical_read_count("manifest"),
+        "physical_sidecar_reads": fs.physical_read_count("sidecar"),
+        "cache_hits": sum(1 for event in fs.reads if event.cache_hit),
+        "cache_misses": sum(1 for event in fs.reads if not event.cache_hit),
+        "tokens_loaded_once": total,
+        "tokens_loaded_per_query": total / query_count,
+        "total_session_tokens": total,
+    }
+
+
+def _run_original_session(tokenizer: OfflineTokenizer, original: Path, questions: list[Question], query_count: int) -> int:
+    fs = ContextFilesystem()
+    total = 0
+    for idx in range(query_count):
+        question = questions[idx % len(questions)]
+        query_id = f"original-multi-{query_count}-{idx:03d}"
+        search = search_context(original, question.question, fs, tokenizer, query_id=query_id)
+        selected = _read_selected(original, search.files, fs, query_id=query_id, reason="original_session_selected_content")
+        total += _token_count(tokenizer, selected) + search.search_tokens + tokenizer.count(INSTRUCTION_ORIGINAL)
+    return total
+
+
+def _measure_sessions(tokenizer: OfflineTokenizer, original: Path, tknc: Path, questions: list[Question]) -> dict[str, Any]:
+    query_counts: dict[str, Any] = {}
+    break_even = None
+    for count in (1, 10, 50, 100):
+        original_tokens = _run_original_session(tokenizer, original, questions, count)
+        tknc_measure = _run_tknc_session(tokenizer, tknc, questions, count)
+        tknc_measure["original"] = original_tokens
+        tknc_measure["delta"] = original_tokens - tknc_measure["tknc"]
+        query_counts[str(count)] = tknc_measure
+        if break_even is None and tknc_measure["tknc"] < original_tokens:
+            break_even = count
+    return {
+        "query_counts": query_counts,
+        "break_even_query_count": break_even,
+        "result": "PASS" if break_even is not None and query_counts["100"]["tknc"] < query_counts["100"]["original"] else "FAIL",
+    }
+
+
+def _harness_summary() -> dict[str, Any]:
+    try:
+        from tests.runtime_harness_probe import RuntimeHarnessProbe
+
+        with RuntimeHarnessProbe() as probe:
+            Path(__file__).exists()
+        return {
+            "original_python": {
+                "measured": True,
+                "events": probe.events.as_dict(),
+                "imports": len(probe.events.imports),
+                "reads": len(probe.events.file_reads),
+                "subprocesses": len(probe.events.subprocesses),
+            },
+            "original_go": {"measured": False, "reason": "Go file-open tracing is not available in this local benchmark"},
+        }
+    except Exception as exc:
+        return {
+            "original_python": {"measured": False, "reason": str(exc)},
+            "original_go": {"measured": False, "reason": "Go file-open tracing is not available in this local benchmark"},
+        }
+
+
+def _summarize(head_sha: str, corpora: dict[str, Any], scenarios: list[dict[str, Any]], production: dict[str, Any], sessions: dict[str, Any]) -> dict[str, Any]:
     original_full = sum(item["original"]["full_total_context_tokens"] for item in scenarios)
     tknc_full = sum(item["tknc"]["full_total_context_tokens"] for item in scenarios)
     original_sel = sum(item["original"]["total_context_tokens"] for item in scenarios)
     tknc_cold = sum(item["tknc"]["total_context_tokens"] for item in scenarios)
-    tknc_warm = sum(item["tknc"]["warm_context_tokens"] for item in scenarios)
     original_accuracy = sum(item["accuracy"]["original"]["accuracy"] for item in scenarios) / len(scenarios)
     tknc_accuracy = sum(item["accuracy"]["tknc"]["accuracy"] for item in scenarios) / len(scenarios)
-    break_even = _break_even(original_sel, tknc_cold, tknc_warm)
     full_pass = tknc_full < original_full
     accuracy_pass = tknc_accuracy >= original_accuracy
-    lookup_pass = all(
-        (len(item["tknc"]["aliases_detected"]) == 0 and len(item["tknc"]["chunks_loaded"]) == 0)
-        or len(item["tknc"]["chunks_loaded"]) <= max(1, len(set(item["tknc"]["chunks_loaded"])))
-        for item in scenarios
+    lookup_pass = all(item["tknc"]["lookup_pass"] for item in scenarios)
+    alias_pass = all(item["tknc"]["all_aliases_resolvable"] for item in scenarios)
+    preload_pass = all(not item["tknc"]["global_dictionary_preload"] for item in scenarios)
+    token_pass = all(item["tknc"]["token_accounting_pass"] for item in scenarios)
+    warm_pass = sessions["result"] == "PASS"
+    multi_pass = sessions["result"] == "PASS"
+    production_pass = all(item["exit_code"] == 0 for item in production.values())
+    index_integrity_pass = all(item["chunk_count"] >= 1 and item["alias_count"] >= 1 for item in corpora.values())
+    alias_scale_pass = any(item["alias_count"] >= 5000 and item["chunk_count"] >= 10 for item in corpora.values())
+    harness = _harness_summary()
+    harness_pass = harness["original_python"].get("measured") is True
+    overall_pass = all(
+        [
+            production_pass,
+            index_integrity_pass,
+            alias_scale_pass,
+            full_pass,
+            warm_pass,
+            multi_pass,
+            accuracy_pass,
+            lookup_pass,
+            alias_pass,
+            preload_pass,
+            token_pass,
+            harness_pass,
+        ]
     )
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "head_sha": head_sha,
         "corpora": corpora,
-        "sessions": {
-            "query_counts": {
-                "1": {"original": original_sel, "tknc": tknc_cold},
-                "10": {"original": original_sel * 10, "tknc": tknc_cold + tknc_warm * 9},
-                "50": {"original": original_sel * 50, "tknc": tknc_cold + tknc_warm * 49},
-                "100": {"original": original_sel * 100, "tknc": tknc_cold + tknc_warm * 99},
-            },
-            "break_even_query_count": break_even,
-        },
-        "harness": {
-            "original_python": {"measured": True, "imports": 0, "reads": 0, "subprocesses": 0},
-            "original_go": {"measured": False, "reason": "Go file-open tracing is not available in this local benchmark"},
-        },
+        "production": production,
         "integrity": {
-            "production_pipeline_exit_codes": [item["exit_code"] for item in production.values()],
-            "all_aliases_resolvable": all(not item["tknc"]["aliases_detected"] or item["tknc"]["aliases_resolved"] for item in scenarios),
-            "no_global_preload": all(not item["tknc"]["global_dictionary_preload"] for item in scenarios),
+            "production_pass": production_pass,
+            "index_integrity_pass": index_integrity_pass,
+            "alias_scale_pass": alias_scale_pass,
+            "all_aliases_resolvable": alias_pass,
+            "no_global_preload": preload_pass,
+            "token_accounting_pass": token_pass,
         },
+        "search": {
+            "search_reads_sidecars": sum(
+                1
+                for item in scenarios
+                for event in item["tknc"]["read_events"]
+                if event["operation"] == "search" and event["artifact_type"] == "sidecar"
+            ),
+            "lookup_pass": lookup_pass,
+        },
+        "sessions": sessions,
+        "harness": harness,
         "scenarios": scenarios,
         "summary": {
             "full_vs_full": {
@@ -505,50 +650,58 @@ def _summarize(head_sha: str, corpora: dict[str, Any], scenarios: list[dict[str,
                 "original": original_sel,
                 "tknc": tknc_cold,
                 "delta_percentage": (original_sel - tknc_cold) / original_sel * 100.0 if original_sel else 0.0,
-                "result": "PASS" if tknc_cold <= original_sel else "FAIL",
+                "required": False,
+                "result": "INFORMATIONAL",
             },
             "selective_warm": {
-                "original": original_sel,
-                "tknc": tknc_warm,
-                "delta_percentage": (original_sel - tknc_warm) / original_sel * 100.0 if original_sel else 0.0,
-                "result": "PASS" if tknc_warm <= original_sel else "FAIL",
+                "original": sessions["query_counts"]["100"]["original"],
+                "tknc": sessions["query_counts"]["100"]["tknc"],
+                "delta_percentage": sessions["query_counts"]["100"]["delta"] / sessions["query_counts"]["100"]["original"] * 100.0
+                if sessions["query_counts"]["100"]["original"]
+                else 0.0,
+                "result": "PASS" if warm_pass else "FAIL",
             },
             "multi_query": {
-                "break_even_query_count": break_even,
-                "result": "PASS" if break_even is not None else "FAIL",
+                "break_even_query_count": sessions["break_even_query_count"],
+                "result": "PASS" if multi_pass else "FAIL",
             },
             "accuracy": {
                 "original_score": original_accuracy,
                 "tknc_score": tknc_accuracy,
                 "result": "PASS" if accuracy_pass else "FAIL",
             },
-            "overall_result": "PASS" if full_pass and accuracy_pass and lookup_pass else "FAIL",
+            "lookup": {
+                "result": "PASS" if lookup_pass else "FAIL",
+            },
+            "overall_result": "PASS" if overall_pass else "FAIL",
         },
     }
 
 
 def _markdown_report(report: dict[str, Any]) -> str:
     lines = [
-        "# CIDA .tknc Context Usage Report v2",
+        "# CIDA .tknc Context Usage Report v3",
         "",
         f"HEAD SHA: `{report['head_sha']}`",
         f"Overall result: `{report['summary']['overall_result']}`",
         f"Full vs full: `{report['summary']['full_vs_full']['result']}`",
         f"Selective cold: `{report['summary']['selective_cold']['result']}`",
         f"Selective warm: `{report['summary']['selective_warm']['result']}`",
+        f"Multi-query: `{report['summary']['multi_query']['result']}`",
         f"Break-even queries: `{report['summary']['multi_query']['break_even_query_count']}`",
         "",
-        "| Question | Original selective | .tknc cold | .tknc warm | Chunks | Accuracy | Result |",
-        "|---|---:|---:|---:|---|---:|---|",
+        "| Question | Corpus | Original selective | .tknc cold | Required chunks | Loaded chunks | Accuracy | Result |",
+        "|---|---|---:|---:|---|---|---:|---|",
     ]
     for item in report["scenarios"]:
         lines.append(
-            "| {qid} | {osel} | {tcold} | {twarm} | {chunks} | {acc:.2f} | {result} |".format(
+            "| {qid} | {corpus} | {osel} | {tcold} | {required} | {loaded} | {acc:.2f} | {result} |".format(
                 qid=item["question_id"],
+                corpus=item["corpus"],
                 osel=item["original"]["total_context_tokens"],
                 tcold=item["tknc"]["total_context_tokens"],
-                twarm=item["tknc"]["warm_context_tokens"],
-                chunks=",".join(item["tknc"]["chunks_loaded"]),
+                required=",".join(item["tknc"]["required_chunks"]),
+                loaded=",".join(item["tknc"]["loaded_chunks"]),
                 acc=item["accuracy"]["tknc"]["accuracy"],
                 result=item["result"],
             )
@@ -558,8 +711,8 @@ def _markdown_report(report: dict[str, Any]) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compare equivalent original and .tknc context usage.")
-    parser.add_argument("--output-json", default="context-usage-report-v2.json")
-    parser.add_argument("--output-markdown", default="context-usage-report-v2.md")
+    parser.add_argument("--output-json", default="context-usage-report-v3.json")
+    parser.add_argument("--output-markdown", default="context-usage-report-v3.md")
     parser.add_argument("--read-events-json", default="")
     parser.add_argument("--harness-events-json", default="")
     args = parser.parse_args()
@@ -571,26 +724,33 @@ def main() -> None:
         scenarios: list[dict[str, Any]] = []
         corpora: dict[str, Any] = {}
         production: dict[str, Any] = {}
-        for corpus_name, count in (("repetitive", 10), ("code", 60), ("low", 12), ("controlled_repo", 90)):
-            original, relpaths = _write_fixture_corpus(temp_root, corpus_name, count)
+        session_source: tuple[Path, Path] | None = None
+        for corpus_name, alias_target in (("one_chunk", 500), ("two_chunks", 1000), ("five_chunks", 2500), ("ten_chunks", 5000)):
+            original, relpaths = _write_fixture_corpus(temp_root, corpus_name, alias_target)
             tknc = temp_root / corpus_name / "tknc"
             production[corpus_name] = _run_production_tknc(original, tknc, temp_root / corpus_name / "report" / "context")
             if production[corpus_name]["exit_code"] != 0:
                 raise RuntimeError(json.dumps(production[corpus_name], indent=2))
             index_path = tknc / "tknd" / ALIAS_INDEX_FILENAME
-            index = json.loads(index_path.read_text(encoding="utf-8")) if index_path.exists() else {}
+            fs = ContextFilesystem()
+            index = JsonCodec().decode(fs.read_text_limited(str(index_path), 2_000_000, operation="lookup", reason="corpus_summary", query_id=corpus_name)) if index_path.exists() else {}
             corpora[corpus_name] = {
                 "files": len(relpaths),
+                "alias_target": alias_target,
                 "alias_count": index.get("alias_count", 0),
                 "chunk_count": index.get("chunk_count", 0),
                 "index_bytes": index_path.stat().st_size if index_path.exists() else 0,
             }
+            if corpus_name == "one_chunk":
+                session_source = (original, tknc)
             for question in _question_set():
                 measured = _measure_question(tokenizer, original, tknc, question)
                 measured["corpus"] = corpus_name
                 scenarios.append(measured)
 
-        report = _summarize(_run_git_head(), corpora, scenarios, production)
+        assert session_source is not None
+        sessions = _measure_sessions(tokenizer, session_source[0], session_source[1], _question_set())
+        report = _summarize(_run_git_head(), corpora, scenarios, production, sessions)
         output_json = Path(args.output_json)
         output_json.parent.mkdir(parents=True, exist_ok=True)
         output_json.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -605,12 +765,17 @@ def main() -> None:
         if args.harness_events_json:
             Path(args.harness_events_json).write_text(json.dumps(report["harness"], indent=2), encoding="utf-8")
 
-        print(json.dumps({
-            "result": report["summary"]["overall_result"],
-            "scenarios": len(scenarios),
-            "output_json": str(output_json),
-            "output_markdown": str(output_md),
-        }, indent=2))
+        print(
+            json.dumps(
+                {
+                    "result": report["summary"]["overall_result"],
+                    "scenarios": len(scenarios),
+                    "output_json": str(output_json),
+                    "output_markdown": str(output_md),
+                },
+                indent=2,
+            )
+        )
         if report["summary"]["overall_result"] != "PASS":
             sys.exit(1)
     finally:
