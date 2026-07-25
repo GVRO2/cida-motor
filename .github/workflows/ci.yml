@@ -49,7 +49,20 @@ jobs:
         python -c "import hashlib, pathlib; p=pathlib.Path('resources/9b5ad71b2ce5302211f9c61530b329a4922fc6a4'); print(hashlib.sha256(p.read_bytes()).hexdigest()) if p.exists() else print('file not found')"
 
     - name: Run Go tests
-      run: go test ./... -count=1 -v
+      run: go test -work ./... -count=1 -v
+
+    - name: Runtime Dependency Policy
+      run: python scripts/check_runtime_dependencies.py
+
+    - name: Resource Profile Unit Tests
+      run: go test -work ./... -run "TestWorkersForProfile|TestResolveResourceSettings" -count=1 -v
+
+    - name: Worker Determinism
+      run: go test -work ./... -run "TestRunPool" -count=1 -v
+
+    - name: Go Race Detector
+      if: matrix.os == 'ubuntu-latest'
+      run: go test -race ./...
 
     - name: Run Python tests
       run: python -m pytest -q

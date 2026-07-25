@@ -19,3 +19,9 @@ Interface de linha de comando para invocar o motor de minificação e monitorame
 - `4` = origem ou caminho inválido
 - `5` = sidecar inválido ou incompatível
 - `6` = erro interno ou falha de determinismo
+## Recursos
+
+- `--resource-profile` aceita `light`, `medium` ou `hard`; sem flag, o default e 10 workers.
+- `--workers N` aceita `1 <= N <= 256` e tem precedencia sobre `--resource-profile`.
+- A execucao imprime CPUs logicas, `GOMAXPROCS`, profile, workers solicitados, workers efetivos e fonte da resolucao.
+- O relatorio JSON gerado pela CLI contem `resources` e `entries`; `resources.python_parallel_execution` permanece `false`.

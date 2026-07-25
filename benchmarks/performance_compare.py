@@ -144,7 +144,11 @@ def _read_report_entries(destination: Path) -> list[dict]:
         data = json.loads(report.read_text(encoding="utf-8"))
     except Exception:
         return []
-    return data if isinstance(data, list) else []
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict) and isinstance(data.get("entries"), list):
+        return data["entries"]
+    return []
 
 
 def _read_report_tokens(destination: Path) -> int:

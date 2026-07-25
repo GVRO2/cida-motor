@@ -97,7 +97,8 @@ class TestPipelineIntegration(unittest.TestCase):
         self.assertTrue(os.path.exists(report_json_path))
 
         with open(report_json_path, "r", encoding="utf-8") as rf:
-            entries = json.load(rf)
+            report_payload = json.load(rf)
+        entries = report_payload.get("entries", []) if isinstance(report_payload, dict) else report_payload
 
         # We expect entries for: A.java, B.java, workflow.md, step-01.md
         # Logo.png and config.json should not be treated as text optimization entries
