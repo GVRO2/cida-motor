@@ -1,5 +1,4 @@
 import tiktoken
-import time
 import os
 import re
 import sys
@@ -57,21 +56,20 @@ def construir_dicionario_rag(pasta_orig, pasta_comp, ext_orig, limite_palavras=3
                     with open(caminho, 'r', encoding='utf-8', errors='ignore') as f:
                         palavras = re.findall(r'\b[a-zA-Z_]{6,}\b', f.read())
                         contador.update(palavras)
-                except:
+                except OSError:
                     pass
 
     palavras_impacto = sorted(contador.items(), key=lambda x: x[1] * len(x[0]), reverse=True)
-    
+
     dicionario = {}
     os.makedirs(os.path.join(pasta_comp, "tknd"), exist_ok=True)
-    
-    id_atual = 0
+
     # Agrupar em arquivos de 500
     for i in range(0, len(palavras_impacto), 500):
         end = min(i + 500, len(palavras_impacto))
         start_id = get_b16_id(i)
-        
-        with open(os.path.join(pasta_comp, "tknd", f"{start_id}.tknd"), 'w', encoding='utf-8') as fd:
+
+        with open(os.path.join(pasta_comp, "tknd", f"{start_id}.cidatkn"), 'w', encoding='utf-8') as fd:
             for j in range(i, end):
                 palavra, freq = palavras_impacto[j]
                 if freq >= 3:
@@ -100,11 +98,11 @@ def minificar_codigo_para_ia(codigo_fonte, dicionario=None):
 def processar_e_comparar(pasta_orig, pasta_comp, ext_orig, ext_comp):
     print("⏳ Analisando frequências e construindo dicionário...")
     dicionario_rag = construir_dicionario_rag(pasta_orig, pasta_comp, ext_orig)
-    
+
     total_tokens_orig = 0
     total_tokens_comp = 0
     total_arquivos = 0
-    
+
     for root, dirs, files in os.walk(pasta_orig):
         for file in files:
             if eh_arquivo_de_teste(root, file, pasta_orig):
@@ -116,7 +114,7 @@ def processar_e_comparar(pasta_orig, pasta_comp, ext_orig, ext_comp):
                 diretorio_alvo = os.path.normpath(os.path.join(pasta_comp, caminho_relativo))
                 os.makedirs(diretorio_alvo, exist_ok=True)
                 caminho_comp_arquivo = os.path.join(diretorio_alvo, arquivo_alvo)
-                
+
                 try:
                     with open(caminho_orig, 'r', encoding='utf-8', errors='ignore') as f1:
                         conteudo_orig = f1.read()

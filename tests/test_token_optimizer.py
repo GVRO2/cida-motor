@@ -1,8 +1,6 @@
 import unittest
 import os
 import sys
-import re
-import shutil
 
 # Setup TIKTOKEN_CACHE_DIR for offline execution
 dir_path = os.path.dirname(os.path.abspath(__file__))
@@ -10,13 +8,13 @@ os.environ["TIKTOKEN_CACHE_DIR"] = os.path.normpath(os.path.join(dir_path, "../r
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 
-from markdown.block_parser import parse_markdown
-from markdown.protected_regions import ProtectedRegionsManager
-from markdown.phrase_dictionary import (
-    count_tokens, generate_alias_candidates, build_file_dictionary, apply_dictionary, find_candidate_words
+from markdown.block_parser import parse_markdown  # noqa: E402
+from markdown.protected_regions import ProtectedRegionsManager  # noqa: E402
+from markdown.phrase_dictionary import (  # noqa: E402
+    generate_alias_candidates, build_file_dictionary,
 )
-from markdown.semantic_validator import validate_semantics, parse_yaml_frontmatter
-from token_optimizer import (
+from markdown.semantic_validator import validate_semantics, parse_yaml_frontmatter  # noqa: E402
+from token_optimizer import (  # noqa: E402
     detect_profile, minificar_codigo_para_ia, remove_html_comments,
     trim_trailing_whitespace, normalize_newlines, table_whitespace,
     list_compaction, build_corpus_dictionary, is_binary_file
@@ -183,7 +181,7 @@ class TestTransformations(unittest.TestCase):
     def test_remove_html_comments(self):
         text = "Hello <!-- comment --> World"
         self.assertEqual(remove_html_comments(text), "Hello  World")
-        
+
         # Preservation of BMAD operational comments
         bmad_comment = "Hello <!-- stepsCompleted=[1] --> World"
         self.assertEqual(remove_html_comments(bmad_comment), bmad_comment)
@@ -256,7 +254,7 @@ class TestCLIOptions(unittest.TestCase):
             f.write("Normal text")
         self.assertFalse(is_binary_file(txt_path))
         os.remove(txt_path)
-        
+
         # Create a binary file
         bin_path = "tests/test_bin.bin"
         with open(bin_path, "wb") as f:
@@ -310,7 +308,7 @@ class TestCLIOptions(unittest.TestCase):
     def test_parse_yaml_frontmatter(self):
         fm_str = "---\nstepsCompleted: [0, 1]\nworkflowType: dev\n---"
         parsed = parse_yaml_frontmatter(fm_str)
-        self.assertEqual(parsed["stepsCompleted"], "[0, 1]")
+        self.assertEqual(parsed["stepsCompleted"], [0, 1])
         self.assertEqual(parsed["workflowType"], "dev")
 
     def test_is_binary_file_with_non_binary(self):

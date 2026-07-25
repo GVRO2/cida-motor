@@ -1,0 +1,301 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  TIKTOKEN_CACHE_DIR: ${{ github.workspace }}/resources
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Python dependencies
+      run: |
+        python -m pip install -r requirements-ci.txt
+
+    - name: Display environment evidence
+      shell: bash
+      run: |
+        echo "=== ENVIRONMENT EVIDENCE ==="
+        echo "Commit SHA: ${{ github.sha }}"
+        echo "Go Version:"
+        go version
+        echo "Python Version:"
+        python --version
+        echo "Tokenizer cached database SHA-256:"
+        python -c "import hashlib, pathlib; p=pathlib.Path('resources/9b5ad71b2ce5302211f9c61530b329a4922fc6a4'); print(hashlib.sha256(p.read_bytes()).hexdigest()) if p.exists() else print('file not found')"
+
+    - name: Run Go tests
+      run: go test ./... -count=1 -v
+
+    - name: Run Python tests
+      run: python -m pytest -q
+
+    - name: Validation Levels and Harness Decoupling
+      run: python -m pytest tests/test_validation_levels.py tests/test_runtime_harness_decoupling.py -q
+
+    - name: Static Analysis
+      run: |
+        python -m ruff check .
+        python -m mypy cida
+
+    - name: Lossless End-to-End Contract
+      run: python -m pytest tests/test_lossless_roundtrip.py -q
+
+    - name: Architecture Boundaries
+      run: python -m pytest tests/architecture -q
+
+    - name: Coverage Gate
+      run: python -m pytest --cov=cida --cov-branch --cov-fail-under=90
+
+    - name: Clean Workspace Gate
+      run: python scripts/check_clean_workspace.py
+
+    - name: Workflow Lint (no masked commands in CI gates)
+      shell: bash
+      run: python -m pytest tests/test_workflow_lint.py -q
+
+  io-failure-contract:
+    name: IO Failure Contracts on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    needs: test
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Python dependencies
+      run: python -m pip install -r requirements-ci.txt
+
+    - name: Run IO failure contract tests
+      run: python -m pytest tests/test_corpus_failure_contracts.py tests/test_report_path_safety.py tests/test_sidecar_path_security.py tests/test_durable_writes.py -q
+
+  sidecar-path-security:
+    name: Sidecar Path Security on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    needs: test
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Python dependencies
+      run: python -m pip install -r requirements-ci.txt
+
+    - name: Run sidecar path security tests
+      run: python -m pytest tests/test_sidecar_path_security.py -q -v
+
+  bundle-integrity:
+    name: Bundle Integrity on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    needs: test
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Python dependencies
+      run: python -m pip install -r requirements-ci.txt
+
+    - name: Run bundle integrity tests
+      run: python -m pytest tests/test_sidecar_validation_errors.py tests/test_sidecar_envelope_e2e.py tests/test_sidecar.py -q
+
+  go-lossless-auto-contract:
+    name: Go Lossless/Auto Contract on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    needs: test
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+
+    - name: Build motor_v3
+      run: go build -o motor_v3_test_bin ./...
+
+    - name: Verify lossless mode correctly rejects unsupported inputs
+      shell: bash
+      run: |
+        mkdir -p /tmp/go_lossless_test_src
+        echo 'public class Foo { void bar() {} }' > /tmp/go_lossless_test_src/Foo.java
+        exit_code=0
+        set +e
+        ./motor_v3_test_bin /tmp/go_lossless_test_src /tmp/go_lossless_test_dst --mode=lossless 2>&1; exit_code=$?
+        set -e
+        python -c "import sys; code=$exit_code; sys.exit(0) if code in (1,4,5) else sys.exit(f'Expected exit 1/4/5, got {code}')"
+        if [ -d /tmp/go_lossless_test_dst ]; then
+          echo "ERROR: destination directory was unexpectedly created"
+          exit 1
+        fi
+
+  benchmark:
+    name: Benchmark on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    needs: test
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Python dependencies
+      run: |
+        python -m pip install -r requirements-ci.txt
+
+    - name: Run Benchmarks and Generate Manifest
+      run: python benchmarks/benchmark_runner.py --manifest-out manifest-${{ matrix.os }}.json
+
+    - name: Balanced Performance Regression Gate
+      run: python benchmarks/performance_compare.py --base-ref origin/main --runs 5 --warmups 1 --validation-level balanced --output performance-balanced-${{ matrix.os }}.json
+
+    - name: Strict Validation Benchmark
+      run: python benchmarks/performance_compare.py --base-ref origin/main --runs 5 --warmups 1 --validation-level strict --output performance-strict-${{ matrix.os }}.json
+
+    - name: Clean Workspace Gate
+      run: python scripts/check_clean_workspace.py
+
+    - name: Upload Manifest Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: manifest-${{ matrix.os }}
+        path: manifest-${{ matrix.os }}.json
+
+    - name: Upload Performance Artifact
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: performance-${{ matrix.os }}
+        path: |
+          performance-balanced-${{ matrix.os }}.json
+          performance-strict-${{ matrix.os }}.json
+
+  compare:
+    name: Compare Manifests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: benchmark
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Python dependencies
+      run: |
+        python -m pip install -r requirements-ci.txt
+
+    - name: Download Ubuntu Manifest
+      uses: actions/download-artifact@v4
+      with:
+        name: manifest-ubuntu-latest
+        path: manifest-ubuntu-latest
+
+    - name: Download Windows Manifest
+      uses: actions/download-artifact@v4
+      with:
+        name: manifest-windows-latest
+        path: manifest-windows-latest
+
+    - name: Cross-Platform Equivalence Check
+      run: |
+        python scripts/compare_manifests.py \
+          manifest-ubuntu-latest/manifest-ubuntu-latest.json \
+          manifest-windows-latest/manifest-windows-latest.json \
+          --strict
+
+    - name: Compare with Base Branch (PR only)
+      if: github.event_name == 'pull_request'
+      run: |
+        echo "Fetching base branch ${{ github.base_ref }}..."
+        git fetch origin ${{ github.base_ref }}
+
+        # Checkout base ref to temporary folder to run benchmark there
+        mkdir -p /tmp/base-code
+        git archive origin/${{ github.base_ref }} | tar -x -C /tmp/base-code
+
+        echo "Running benchmark on base branch..."
+        cd /tmp/base-code
+        python -m pip install -r requirements-ci.txt
+        python benchmarks/benchmark_runner.py --manifest-out /tmp/manifest-base.json
+
+        echo "Comparing PR manifest with base branch manifest..."
+        cd $GITHUB_WORKSPACE
+        python scripts/compare_manifests.py /tmp/manifest-base.json manifest-ubuntu-latest/manifest-ubuntu-latest.json
