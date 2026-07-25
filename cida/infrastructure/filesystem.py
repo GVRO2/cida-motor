@@ -3,6 +3,8 @@ import tempfile
 import shutil
 from typing import List
 
+from cida.domain.errors import SidecarValidationError
+
 class PhysicalFilesystem:
     """Concrete implementation of filesystem repository."""
 
@@ -21,6 +23,19 @@ class PhysicalFilesystem:
     def read_bytes(self, filepath: str) -> bytes:
         with open(filepath, 'rb') as f:
             return f.read()
+
+    def file_size(self, filepath: str) -> int:
+        return os.stat(filepath).st_size
+
+    def read_bytes_limited(self, filepath: str, max_bytes: int) -> bytes:
+        size = self.file_size(filepath)
+        if size > max_bytes:
+            raise SidecarValidationError(f"Sidecar artifact exceeds size limit before read: {filepath}")
+        with open(filepath, 'rb') as f:
+            data = f.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise SidecarValidationError(f"Sidecar artifact exceeds size limit during read: {filepath}")
+        return data
 
     def write_text(self, filepath: str, content: str, encoding: str = "utf-8", durable: bool = False) -> None:
         abs_path = os.path.abspath(filepath)

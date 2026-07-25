@@ -40,8 +40,12 @@ def test_sidecar_validate_schema_errors():
         validate_sidecar_schema(base)
 
     base["format"] = "cida-token-sidecar"
-    base["version"] = 2
+    base["version"] = 3
     with pytest.raises(SidecarValidationError, match="Unsupported version"):
+        validate_sidecar_schema(base)
+
+    base["version"] = 2
+    with pytest.raises(SidecarValidationError, match="Missing required key: dictionary_id"):
         validate_sidecar_schema(base)
 
     base["version"] = 1

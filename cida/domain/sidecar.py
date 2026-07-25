@@ -184,7 +184,7 @@ def validate_sidecar_schema(data: dict):
     if not isinstance(data, dict):
         raise SidecarValidationError("Sidecar must be a JSON object")
 
-    required_keys = ["format", "version", "source", "source_sha256", "entries"]
+    required_keys = ["format", "version", "source", "entries"]
     for k in required_keys:
         if k not in data:
             raise SidecarValidationError(f"Missing required key: {k}")
@@ -192,8 +192,23 @@ def validate_sidecar_schema(data: dict):
     if data["format"] != "cida-token-sidecar":
         raise SidecarValidationError(f"Unsupported format: {data['format']}")
 
-    if data["version"] != 1:
+    if data["version"] not in (1, 2):
         raise SidecarValidationError(f"Unsupported version: {data['version']}")
+
+    if data["version"] == 1 and "source_sha256" not in data:
+        raise SidecarValidationError("Missing required key: source_sha256")
+
+    if data["version"] == 2:
+        required_v2 = [
+            "dictionary_id",
+            "manifest_sha256",
+            "chunk_index",
+            "chunk_count",
+            "entries_sha256",
+        ]
+        for k in required_v2:
+            if k not in data:
+                raise SidecarValidationError(f"Missing required key: {k}")
 
     if not isinstance(data["entries"], dict):
         raise SidecarValidationError("entries must be a dictionary")

@@ -1,5 +1,5 @@
 from cida.application.ports import TokenCounter, FileRepository, HashService, JsonCodec, DictionaryBuilder
-from cida.application.selective_alias_resolution import ALIAS_INDEX_FILENAME, build_alias_index
+from cida.application.selective_alias_resolution import ALIAS_INDEX_FILENAME, build_alias_index, corpus_chunk_filename
 from cida.domain.errors import SourcePathError, InternalProcessingError
 from cida.domain.policies import is_binary_extension
 from cida.domain.processing_context import FileInventory
@@ -15,6 +15,7 @@ class CorpusOptimizerUsecase:
         self.hash_service = hash_service
         self.json_codec = json_codec
         self.dictionary_builder = dictionary_builder
+        self._last_manifest: dict | None = None
 
     def build_file_inventory(
         self,
@@ -87,20 +88,29 @@ class CorpusOptimizerUsecase:
                         f"Failed to hash corpus source '{fp}': {exc}"
                     ) from exc
         manifest_files.sort(key=lambda x: x["path"])
-        manifest = {"files": manifest_files}
+        manifest = {"format": "cida-corpus-manifest", "schema_version": 1, "files": manifest_files}
         manifest_bytes = self.json_codec.canonical_encode(manifest).encode('utf-8')
         corpus_hash = self.hash_service.sha256(manifest_bytes)
+        manifest["manifest_sha256"] = corpus_hash
+        self._last_manifest = manifest
+        dictionary_id = self.hash_service.sha256(self.json_codec.canonical_encode(corpus_dict).encode('utf-8'))
 
         items = list(corpus_dict.items())
         sidecar_tokens_total = 0
-        for i in range(0, len(items), 500):
+        chunk_count = (len(items) + 499) // 500
+        for chunk_index, i in enumerate(range(0, len(items), 500)):
             chunk = items[i:i+500]
             entries_map = {alias: word for word, alias in chunk}
+            entries_sha256 = self.hash_service.sha256(self.json_codec.canonical_encode(entries_map).encode('utf-8'))
             sidecar_data = {
                 "format": "cida-token-sidecar",
-                "version": 1,
+                "version": 2,
                 "source": "corpus",
-                "source_sha256": corpus_hash,
+                "dictionary_id": dictionary_id,
+                "manifest_sha256": corpus_hash,
+                "chunk_index": chunk_index,
+                "chunk_count": chunk_count,
+                "entries_sha256": entries_sha256,
                 "entries": entries_map
             }
             sidecar_tokens_total += self.token_counter.count(self.json_codec.encode(sidecar_data, indent=4))
@@ -117,32 +127,50 @@ class CorpusOptimizerUsecase:
         self.file_repo.makedirs(tknd_dir)
         alias_to_chunk = {}
         chunk_hashes = {}
-        for i in range(0, len(items), 500):
+        chunk_entry_counts = {}
+        dictionary_id = self.hash_service.sha256(self.json_codec.canonical_encode(corpus_dict).encode('utf-8'))
+        chunk_count = (len(items) + 499) // 500
+        filenames_seen = set()
+        for chunk_index, i in enumerate(range(0, len(items), 500)):
             chunk = items[i:i+500]
-            prefixChars = "ABCDEF"
-            start_id = prefixChars[min(i // 500, len(prefixChars)-1)] + str(i % 500)
             entries_map = {alias: word for word, alias in chunk}
+            entries_sha256 = self.hash_service.sha256(self.json_codec.canonical_encode(entries_map).encode('utf-8'))
             sidecar_data = {
                 "format": "cida-token-sidecar",
-                "version": 1,
+                "version": 2,
                 "source": "corpus",
-                "source_sha256": corpus_hash,
+                "dictionary_id": dictionary_id,
+                "manifest_sha256": corpus_hash,
+                "chunk_index": chunk_index,
+                "chunk_count": chunk_count,
+                "entries_sha256": entries_sha256,
                 "entries": entries_map
             }
-            chunk_filename = f"{start_id}.cidatkn"
+            chunk_filename = corpus_chunk_filename(chunk_index)
+            if chunk_filename in filenames_seen:
+                raise InternalProcessingError(f"Duplicate corpus chunk filename generated: {chunk_filename}")
+            filenames_seen.add(chunk_filename)
             dict_file_path = self.file_repo.join(tknd_dir, chunk_filename)
             serialized = self.json_codec.encode(sidecar_data, indent=4)
             self.file_repo.write_text(dict_file_path, serialized)
             chunk_hashes[chunk_filename] = self.hash_service.sha256(serialized.encode("utf-8"))
+            chunk_entry_counts[chunk_filename] = len(entries_map)
             for alias in entries_map:
+                if alias in alias_to_chunk:
+                    raise InternalProcessingError(f"Duplicate alias in corpus dictionary: {alias}")
                 alias_to_chunk[alias] = chunk_filename
 
         index_data = build_alias_index(
             alias_to_chunk=alias_to_chunk,
-            dictionary_id=corpus_hash,
+            dictionary_id=dictionary_id,
             chunk_hashes=chunk_hashes,
             hash_service=self.hash_service,
             json_codec=self.json_codec,
+            manifest_sha256=corpus_hash,
+            chunk_entry_counts=chunk_entry_counts,
         )
         index_path = self.file_repo.join(tknd_dir, ALIAS_INDEX_FILENAME)
         self.file_repo.write_text(index_path, self.json_codec.encode(index_data, indent=4))
+        if self._last_manifest is not None:
+            manifest_path = self.file_repo.join(dst_abs, "tknc-manifest.json")
+            self.file_repo.write_text(manifest_path, self.json_codec.encode(self._last_manifest, indent=4))
