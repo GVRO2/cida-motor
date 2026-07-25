@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -8,9 +9,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -56,11 +59,15 @@ func getToolPath(toolName string) string {
 }
 
 func runPythonCommand(args ...string) *exec.Cmd {
+	return runPythonCommandContext(context.Background(), args...)
+}
+
+func runPythonCommandContext(ctx context.Context, args ...string) *exec.Cmd {
 	pythonExec := "python"
 	if _, err := exec.LookPath("python"); err != nil {
 		pythonExec = "python3"
 	}
-	cmd := exec.Command(pythonExec, args...)
+	cmd := exec.CommandContext(ctx, pythonExec, args...)
 	cmd.Env = append(os.Environ(), "TIKTOKEN_CACHE_DIR="+filepath.Join(filepath.Dir(getToolPath("token_counter.py")), "resources"))
 	return cmd
 }
@@ -80,10 +87,14 @@ func resolveValidationLevel(validationLevel string, strictValidation bool, valid
 }
 
 func estimarTokens(texto string) (int, error) {
+	return estimarTokensContext(context.Background(), texto)
+}
+
+func estimarTokensContext(ctx context.Context, texto string) (int, error) {
 	if texto == "" {
 		return 0, nil
 	}
-	cmd := runPythonCommand(getToolPath("token_counter.py"))
+	cmd := runPythonCommandContext(ctx, getToolPath("token_counter.py"))
 	cmd.Stdin = strings.NewReader(texto)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
@@ -236,6 +247,10 @@ func main() {
 	strictValidation := false
 	validationLevelExplicit := false
 	modeExplicit := false
+	resourceProfile := "default"
+	resourceProfileExplicit := false
+	requestedWorkers := 0
+	workersExplicit := false
 
 	// Parse flags manually to preserve existing go run motor_v3.go <src> [dst] syntax
 	args := os.Args[1:]
@@ -267,6 +282,30 @@ func main() {
 		} else if arg == "--validation-level" && i+1 < len(args) {
 			validationLevel = args[i+1]
 			validationLevelExplicit = true
+			i++
+		} else if strings.HasPrefix(arg, "--resource-profile=") {
+			resourceProfile = strings.TrimPrefix(arg, "--resource-profile=")
+			resourceProfileExplicit = true
+		} else if arg == "--resource-profile" && i+1 < len(args) {
+			resourceProfile = args[i+1]
+			resourceProfileExplicit = true
+			i++
+		} else if strings.HasPrefix(arg, "--workers=") {
+			parsed, err := strconv.Atoi(strings.TrimPrefix(arg, "--workers="))
+			if err != nil {
+				fmt.Printf("❌ Erro: --workers deve ser inteiro: %s\n", strings.TrimPrefix(arg, "--workers="))
+				os.Exit(1)
+			}
+			requestedWorkers = parsed
+			workersExplicit = true
+		} else if arg == "--workers" && i+1 < len(args) {
+			parsed, err := strconv.Atoi(args[i+1])
+			if err != nil {
+				fmt.Printf("❌ Erro: --workers deve ser inteiro: %s\n", args[i+1])
+				os.Exit(1)
+			}
+			requestedWorkers = parsed
+			workersExplicit = true
 			i++
 		} else if strings.HasPrefix(arg, "--mode=") {
 			mode = strings.TrimPrefix(arg, "--mode=")
@@ -331,6 +370,12 @@ func main() {
 	validReports := map[string]bool{"text": true, "json": true, "both": true}
 	if !validReports[reportFormat] {
 		fmt.Printf("❌ Erro: Formato de relatório inválido: %s\n", reportFormat)
+		os.Exit(1)
+	}
+
+	resources, resourceErr := detectResourceSettings(resourceProfile, resourceProfileExplicit, requestedWorkers, workersExplicit)
+	if resourceErr != nil {
+		fmt.Printf("Error: %s\n", resourceErr)
 		os.Exit(1)
 	}
 
@@ -416,6 +461,17 @@ func main() {
 	fmt.Println("🚀 Iniciando Otimização e Minificação (CIDA Motor Go/Python)")
 	fmt.Printf("📂 Origem: %s\n📂 Destino: %s\n", pastaOrig, pastaComp)
 
+	fmt.Printf("Logical CPUs: %d\n", resources.LogicalCPUs)
+	fmt.Printf("GOMAXPROCS: %d\n", resources.GOMAXPROCS)
+	fmt.Printf("Resource profile: %s\n", resources.Profile)
+	if resources.RequestedWorkers == nil {
+		fmt.Println("Requested workers: <none>")
+	} else {
+		fmt.Printf("Requested workers: %d\n", *resources.RequestedWorkers)
+	}
+	fmt.Printf("Effective workers: %d\n", resources.EffectiveWorkers)
+	fmt.Printf("Resolution source: %s\n", resources.ResolutionSource)
+
 	if isWatcher {
 		fmt.Println("👀 Modo Watcher ativado. Pressione Ctrl+C para sair.")
 		var lastModTimes = make(map[string]time.Time)
@@ -456,12 +512,12 @@ func main() {
 
 			if changed {
 				fmt.Println("🔄 Alteração detectada, recompilando...")
-				processarEComparar(pastaOrig, pastaComp, mode, modeExplicit, profile, dictScope, validationLevel, validationLevelExplicit, failOnInflation, reportFormat, reportPath, verifySemantics, dryRun, continueOnError, noCache, durableWrites)
+				processarEComparar(pastaOrig, pastaComp, mode, modeExplicit, profile, dictScope, validationLevel, validationLevelExplicit, failOnInflation, reportFormat, reportPath, verifySemantics, dryRun, continueOnError, noCache, durableWrites, resources)
 			}
 			time.Sleep(2 * time.Second)
 		}
 	} else {
-		processarEComparar(pastaOrig, pastaComp, mode, modeExplicit, profile, dictScope, validationLevel, validationLevelExplicit, failOnInflation, reportFormat, reportPath, verifySemantics, dryRun, continueOnError, noCache, durableWrites)
+		processarEComparar(pastaOrig, pastaComp, mode, modeExplicit, profile, dictScope, validationLevel, validationLevelExplicit, failOnInflation, reportFormat, reportPath, verifySemantics, dryRun, continueOnError, noCache, durableWrites, resources)
 	}
 
 }
@@ -542,7 +598,7 @@ type JavaRawMetric struct {
 	TokensAuxiliares int    `json:"tokens_auxiliares"`
 }
 
-func processarEComparar(pastaOrig string, pastaComp string, mode string, modeExplicit bool, profile string, dictScope string, validationLevel string, validationLevelExplicit bool, failOnInflation bool, reportFormat string, reportPath string, verifySemantics bool, dryRun bool, continueOnError bool, noCache bool, durableWrites bool) {
+func processarEComparar(pastaOrig string, pastaComp string, mode string, modeExplicit bool, profile string, dictScope string, validationLevel string, validationLevelExplicit bool, failOnInflation bool, reportFormat string, reportPath string, verifySemantics bool, dryRun bool, continueOnError bool, noCache bool, durableWrites bool, resources ResourceSettings) {
 	absOrig, err := filepath.Abs(pastaOrig)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Erro ao resolver caminho de origem: %v\n", err)
@@ -619,6 +675,10 @@ func processarEComparar(pastaOrig string, pastaComp string, mode string, modeExp
 		os.Exit(4)
 	}
 
+	sort.Strings(javaFiles)
+	sort.Strings(mdFiles)
+	sort.Strings(binaryFiles)
+
 	// 2. Process Java files natively in Go
 	var javaMetrics []JavaRawMetric
 	var tempJavaJsonPath string
@@ -647,8 +707,62 @@ func processarEComparar(pastaOrig string, pastaComp string, mode string, modeExp
 		var infos []fileInfo
 		var origTokensTotal int = 0
 		var miniTokensTotal int = 0
+		javaJobs := make([]Job[string], 0, len(javaFiles))
+		for idx, fp := range javaFiles {
+			javaJobs = append(javaJobs, Job[string]{Index: idx, Value: fp})
+		}
+		poolResults := RunPoolWithOptions(context.Background(), resources.EffectiveWorkers, javaJobs, func(ctx context.Context, fp string) (fileInfo, error) {
+			relPath, err := filepath.Rel(absOrig, fp)
+			if err != nil {
+				return fileInfo{}, fmt.Errorf("erro ao calcular caminho relativo para %s: %w", fp, err)
+			}
+			destPath := filepath.Join(absComp, relPath) + ".tknc"
 
-		for _, fp := range javaFiles {
+			contentBytes, err := os.ReadFile(fp)
+			if err != nil {
+				return fileInfo{}, fmt.Errorf("erro ao ler arquivo Java %s: %w", fp, err)
+			}
+			contentStr := string(contentBytes)
+			origTok, err := estimarTokensContext(ctx, contentStr)
+			if err != nil {
+				return fileInfo{}, fmt.Errorf("erro no tokenizer ao processar original %s: %w", fp, err)
+			}
+
+			start := time.Now()
+			minified := minificarCodigoParaIA(contentStr, dicionario)
+			elapsed := time.Since(start).Nanoseconds()
+
+			miniTok, err := estimarTokensContext(ctx, minified)
+			if err != nil {
+				return fileInfo{}, fmt.Errorf("erro no tokenizer ao processar minificado %s: %w", fp, err)
+			}
+
+			return fileInfo{
+				relPath:         relPath,
+				destPath:        destPath,
+				originalContent: contentStr,
+				minifiedContent: minified,
+				origTokens:      origTok,
+				miniTokens:      miniTok,
+				elapsedNs:       elapsed,
+			}, nil
+		}, PoolOptions{ContinueOnError: continueOnError})
+
+		for _, result := range poolResults {
+			if result.Err != nil {
+				fmt.Fprintf(os.Stderr, "Error processing Java file: %v\n", result.Err)
+				if !continueOnError {
+					os.Exit(exitCodeForJavaProcessingError(result.Err))
+				}
+				continue
+			}
+			infos = append(infos, result.Value)
+			origTokensTotal += result.Value.origTokens
+			miniTokensTotal += result.Value.miniTokens
+		}
+		sequentialJavaFiles := []string{}
+
+		for _, fp := range sequentialJavaFiles {
 			relPath, err := filepath.Rel(absOrig, fp)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "❌ Erro ao calcular caminho relativo para %s: %v\n", fp, err)
@@ -856,6 +970,14 @@ func processarEComparar(pastaOrig string, pastaComp string, mode string, modeExp
 		}
 		if durableWrites {
 			pyArgs = append(pyArgs, "--durable-writes")
+		}
+		pyArgs = append(pyArgs, "--resource-profile", resources.Profile)
+		pyArgs = append(pyArgs, "--workers", strconv.Itoa(resources.EffectiveWorkers))
+		pyArgs = append(pyArgs, "--logical-cpus", strconv.Itoa(resources.LogicalCPUs))
+		pyArgs = append(pyArgs, "--gomaxprocs", strconv.Itoa(resources.GOMAXPROCS))
+		pyArgs = append(pyArgs, "--resource-resolution-source", resources.ResolutionSource)
+		if resources.RequestedWorkers != nil {
+			pyArgs = append(pyArgs, "--requested-workers", strconv.Itoa(*resources.RequestedWorkers))
 		}
 		// If Java files were processed, pass the raw json parameter
 		if _, err := os.Stat(filepath.Join(absComp, ".cida_java_raw.json")); err == nil {
@@ -1184,4 +1306,218 @@ func construirDicionario(pastaOrig string, javaFiles []string, corpusHash string
 		}
 	}
 	return dicionario, sidecars
+}
+
+const (
+	defaultWorkerCount = 10
+	minWorkerCount     = 1
+	maxWorkerCount     = 256
+)
+
+type ResourceSettings struct {
+	LogicalCPUs      int    `json:"logical_cpus"`
+	GOMAXPROCS       int    `json:"gomaxprocs"`
+	Profile          string `json:"profile"`
+	RequestedWorkers *int   `json:"requested_workers"`
+	EffectiveWorkers int    `json:"effective_workers"`
+	ResolutionSource string `json:"resolution_source"`
+}
+
+func resolveResourceSettings(profile string, profileExplicit bool, requestedWorkers int, workersExplicit bool, numCPU func() int, gomaxprocs func() int) (ResourceSettings, error) {
+	logicalCPUs := numCPU()
+	if logicalCPUs < 1 {
+		logicalCPUs = 1
+	}
+	gmp := gomaxprocs()
+	if gmp < 1 {
+		gmp = 1
+	}
+
+	settings := ResourceSettings{
+		LogicalCPUs:      logicalCPUs,
+		GOMAXPROCS:       gmp,
+		Profile:          "default",
+		EffectiveWorkers: defaultWorkerCount,
+		ResolutionSource: "default",
+	}
+
+	if profileExplicit {
+		workers, err := workersForProfile(profile, logicalCPUs)
+		if err != nil {
+			return settings, err
+		}
+		settings.Profile = profile
+		settings.EffectiveWorkers = workers
+		settings.ResolutionSource = "profile"
+	}
+
+	if workersExplicit {
+		if requestedWorkers < minWorkerCount || requestedWorkers > maxWorkerCount {
+			return settings, fmt.Errorf("--workers must be between %d and %d", minWorkerCount, maxWorkerCount)
+		}
+		value := requestedWorkers
+		settings.RequestedWorkers = &value
+		settings.EffectiveWorkers = requestedWorkers
+		settings.ResolutionSource = "explicit_workers"
+		if !profileExplicit {
+			settings.Profile = "custom"
+		}
+	}
+
+	return settings, nil
+}
+
+func detectResourceSettings(profile string, profileExplicit bool, requestedWorkers int, workersExplicit bool) (ResourceSettings, error) {
+	return resolveResourceSettings(
+		profile,
+		profileExplicit,
+		requestedWorkers,
+		workersExplicit,
+		runtime.NumCPU,
+		func() int { return runtime.GOMAXPROCS(0) },
+	)
+}
+
+func workersForProfile(profile string, logicalCPUs int) (int, error) {
+	if logicalCPUs < 1 {
+		logicalCPUs = 1
+	}
+	switch profile {
+	case "light":
+		return clampWorkers(maxInt(1, minInt(4, logicalCPUs/2))), nil
+	case "medium":
+		return clampWorkers(minInt(10, maxInt(2, logicalCPUs))), nil
+	case "hard":
+		return clampWorkers(minInt(64, maxInt(10, logicalCPUs*2))), nil
+	default:
+		return 0, fmt.Errorf("invalid resource profile: %s", profile)
+	}
+}
+
+func clampWorkers(workers int) int {
+	if workers < minWorkerCount {
+		return minWorkerCount
+	}
+	if workers > maxWorkerCount {
+		return maxWorkerCount
+	}
+	return workers
+}
+
+func minInt(a int, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a int, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func exitCodeForJavaProcessingError(err error) int {
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "tokenizer") {
+		return 2
+	}
+	if strings.Contains(message, "caminho") || strings.Contains(message, "ler arquivo") {
+		return 4
+	}
+	return 6
+}
+
+type Job[T any] struct {
+	Index int
+	Value T
+}
+
+type Result[R any] struct {
+	Index int
+	Value R
+	Err   error
+}
+
+type PoolOptions struct {
+	ContinueOnError bool
+}
+
+func RunPool[T any, R any](
+	ctx context.Context,
+	workers int,
+	jobs []Job[T],
+	fn func(context.Context, T) (R, error),
+) []Result[R] {
+	return RunPoolWithOptions(ctx, workers, jobs, fn, PoolOptions{})
+}
+
+func RunPoolWithOptions[T any, R any](
+	ctx context.Context,
+	workers int,
+	jobs []Job[T],
+	fn func(context.Context, T) (R, error),
+	options PoolOptions,
+) []Result[R] {
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(jobs) && len(jobs) > 0 {
+		workers = len(jobs)
+	}
+
+	results := make([]Result[R], len(jobs))
+	if len(jobs) == 0 {
+		return results
+	}
+
+	poolCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	jobCh := make(chan Job[T])
+	var wg sync.WaitGroup
+
+	for workerID := 0; workerID < workers; workerID++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobCh {
+				if poolCtx.Err() != nil && !options.ContinueOnError {
+					results[job.Index] = Result[R]{Index: job.Index, Err: poolCtx.Err()}
+					continue
+				}
+				value, err := runPoolJob(poolCtx, job.Value, fn)
+				results[job.Index] = Result[R]{Index: job.Index, Value: value, Err: err}
+				if err != nil && !options.ContinueOnError {
+					cancel()
+				}
+			}
+		}()
+	}
+
+	for _, job := range jobs {
+		if poolCtx.Err() != nil && !options.ContinueOnError {
+			results[job.Index] = Result[R]{Index: job.Index, Err: poolCtx.Err()}
+			continue
+		}
+		jobCh <- job
+	}
+	close(jobCh)
+	wg.Wait()
+
+	return results
+}
+
+func runPoolJob[T any, R any](
+	ctx context.Context,
+	value T,
+	fn func(context.Context, T) (R, error),
+) (result R, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("worker panic: %v", recovered)
+		}
+	}()
+	return fn(ctx, value)
 }

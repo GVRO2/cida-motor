@@ -45,3 +45,22 @@ Após a conclusão da minificação:
 *   `md_minifier.py`: Módulo específico para minificação de arquivos Markdown.
 *   `token_counter.py` / `token.py`: Lógica relacionada à contagem e gestão de tokens.
 *   `tests/`: Suite de testes para garantir a integridade da tokenização e minificação.
+## Perfis de Recursos
+
+```bash
+go run motor_v3.go <pasta_original> [pasta_destino] [--resource-profile light|medium|hard] [--workers N]
+```
+
+| Perfil | Objetivo | Workers |
+| --- | --- | --- |
+| default | compatibilidade | 10 |
+| light | baixo consumo | `max(1, min(4, logical_cpus / 2))` |
+| medium | equilibrio | `min(10, max(2, logical_cpus))` |
+| hard | alto throughput | `min(64, max(10, logical_cpus * 2))` |
+| custom | controle manual | `--workers N` |
+
+Precedencia: `--workers` explicito sobrescreve `--resource-profile`; `--resource-profile` explicito sobrescreve o default; sem flags o motor usa 10 workers.
+
+## Dependencias
+
+Runtime permitido: Python stdlib, Go stdlib e `tiktoken`. Desenvolvimento/CI: `pytest`, `hypothesis`, `pytest-cov`, `pytest-mock`, `ruff` e `mypy`. A politica completa esta em `docs/DEPENDENCY_POLICY.md`.

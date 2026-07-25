@@ -1,4 +1,5 @@
 import re
+from typing import Any
 from cida.application.ports import FileRepository, JsonCodec
 
 class ReportGeneratorUsecase:
@@ -8,6 +9,10 @@ class ReportGeneratorUsecase:
         self.file_repo = file_repo
         self.json_codec = json_codec
         self.entries: list = []
+        self.resources: dict | None = None
+
+    def set_resources(self, resources: dict) -> None:
+        self.resources = resources
 
     def add_entry(self, filepath: str, profile: str, tokens_orig: int, tokens_base: int, tokens_new: int,
                   dict_included: bool, tokens_sidecar: int, tokens_aux: int, accepted_transforms: list,
@@ -88,5 +93,11 @@ class ReportGeneratorUsecase:
 
         if report_format in ["json", "both"]:
             self.file_repo.makedirs(self.file_repo.dirname(json_path))
-            serialized_json = self.json_codec.encode(self.entries, indent=4)
+            payload: Any = self.entries
+            if self.resources is not None:
+                payload = {
+                    "resources": self.resources,
+                    "entries": self.entries,
+                }
+            serialized_json = self.json_codec.encode(payload, indent=4)
             self.file_repo.write_text(json_path, serialized_json)

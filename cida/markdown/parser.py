@@ -1,18 +1,6 @@
 import re
-import yaml  # type: ignore
+from cida.infrastructure.frontmatter_codec import FrontmatterCodec, UniqueKeyLoader  # noqa: F401
 
-class UniqueKeyLoader(yaml.SafeLoader):
-    def construct_mapping(self, node, deep=False):
-        mapping = []
-        for key_node, value_node in node.value:
-            key = self.construct_object(key_node, deep=deep)
-            if key in [k for k, _ in mapping]:
-                raise yaml.constructor.ConstructorError(
-                    None, None, f"Duplicate key '{key}' found in YAML frontmatter", key_node.start_mark
-                )
-            value = self.construct_object(value_node, deep=deep)
-            mapping.append((key, value))
-        return super().construct_mapping(node, deep=deep)
 
 class Block:
     def __init__(self, block_type, content, metadata=None):
@@ -26,14 +14,8 @@ class Block:
 def find_frontmatter_end(lines):
     for idx in range(1, len(lines)):
         if lines[idx].strip() == "---":
-            yaml_str = "".join(lines[1:idx])
-            try:
-                yaml.load(yaml_str, Loader=UniqueKeyLoader)
-                return idx
-            except yaml.constructor.ConstructorError:
-                return idx
-            except Exception:
-                continue
+            FrontmatterCodec().decode("".join(lines[1:idx]))
+            return idx
     return -1
 
 def has_frontmatter_at_document_start(text):

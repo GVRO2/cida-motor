@@ -1,7 +1,7 @@
 import os
 import pytest
 from unittest.mock import patch
-from cida.domain.errors import TokenizerError, SemanticValidationError
+from cida.domain.errors import TokenizerError, SemanticValidationError, UnsupportedFrontmatterSyntaxError
 from cida.infrastructure.yaml_codec import YamlCodec
 from cida.infrastructure.tokenizer import OfflineTokenizer
 from cida.infrastructure.hashing import HashService
@@ -36,15 +36,15 @@ def test_yaml_codec_frontmatter_safe():
     assert codec.parse_yaml_frontmatter_safe("---\n\n---") == {}
 
     # Duplicate key
-    with pytest.raises(ValueError, match="YAML parsing error"):
+    with pytest.raises(UnsupportedFrontmatterSyntaxError, match="Duplicate key"):
         codec.parse_yaml_frontmatter_safe("---\nkey: val1\nkey: val2\n---")
 
     # Non-dict frontmatter
-    with pytest.raises(ValueError, match="Frontmatter must be a key-value dictionary"):
+    with pytest.raises(SemanticValidationError, match="Frontmatter must be a key-value dictionary"):
         codec.parse_yaml_frontmatter_safe("---\n- item1\n- item2\n---")
 
     # General YAML syntax error
-    with pytest.raises(ValueError, match="YAML parsing error"):
+    with pytest.raises(UnsupportedFrontmatterSyntaxError, match="Ambiguous scalar"):
         codec.parse_yaml_frontmatter_safe("---\nkey: : bad\n---")
 
 def test_yaml_codec_decode_errors():

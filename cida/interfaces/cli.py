@@ -261,10 +261,18 @@ def main():
         parser.add_argument("--verify-semantics", action=argparse.BooleanOptionalAction, default=True, help="Run semantic validations")
         parser.add_argument("--validation-level", choices=["balanced", "strict"], help="Validation security level: balanced (default) or strict")
         parser.add_argument("--strict-validation", action="store_true", help="Alias for --validation-level strict")
+        parser.add_argument("--resource-profile", default="default", choices=["default", "light", "medium", "hard", "custom"], help="Resource profile accepted for Go/Python CLI parity")
+        parser.add_argument("--workers", type=int, default=10, help="Maximum worker count accepted for Go/Python CLI parity")
+        parser.add_argument("--logical-cpus", type=int, default=None, help=argparse.SUPPRESS)
+        parser.add_argument("--gomaxprocs", type=int, default=None, help=argparse.SUPPRESS)
+        parser.add_argument("--requested-workers", type=int, default=None, help=argparse.SUPPRESS)
+        parser.add_argument("--resource-resolution-source", default="python_cli", help=argparse.SUPPRESS)
         parser.add_argument("--dry-run", action="store_true", help="Dry run mode (no files written)")
         parser.add_argument("--java-raw-json", help="Path to temporary Java raw metrics JSON")
 
         args = parser.parse_args()
+        if args.workers < 1 or args.workers > 256:
+            parser.error("--workers must be between 1 and 256")
 
         if args.strict_validation and args.validation_level not in (None, ValidationLevel.STRICT):
             parser.error("--strict-validation cannot be combined with --validation-level balanced")
@@ -303,6 +311,15 @@ def main():
                 print(f"Warning: failed to read Java raw metrics JSON: {je}")
 
         report_gen = ReportGeneratorUsecase(file_repo, json_codec)
+        report_gen.set_resources({
+            "logical_cpus": args.logical_cpus or os.cpu_count() or 1,
+            "gomaxprocs": args.gomaxprocs,
+            "profile": args.resource_profile,
+            "requested_workers": args.requested_workers,
+            "effective_workers": args.workers,
+            "resolution_source": args.resource_resolution_source,
+            "python_parallel_execution": False,
+        })
         file_opt = None
         if args.profile == "auto" or args.dictionary_scope == "file":
             from cida.application.optimize_file import FileOptimizerUsecase

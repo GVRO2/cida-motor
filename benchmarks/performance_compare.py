@@ -10,6 +10,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import venv
 from io import BytesIO
 from pathlib import Path
 
@@ -56,11 +57,62 @@ def _build_binary(project: Path, output: Path) -> None:
         raise RuntimeError(f"go build failed in {project}:\n{result.stderr}")
 
 
-def _python_cli_command(project: Path) -> list[str]:
+def _venv_python(venv_dir: Path) -> Path:
+    if sys.platform == "win32":
+        return venv_dir / "Scripts" / "python.exe"
+    return venv_dir / "bin" / "python"
+
+
+def _python_bin_dir(python_exe: Path) -> Path:
+    return python_exe.parent
+
+
+def _prepare_python_env(project: Path, venv_dir: Path, install_legacy_yaml: bool = False) -> Path:
+    builder = venv.EnvBuilder(with_pip=True, system_site_packages=True)
+    builder.create(venv_dir)
+    python_exe = _venv_python(venv_dir)
+    tiktoken_check = subprocess.run(
+        [str(python_exe), "-c", "import tiktoken"],
+        cwd=str(project),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if tiktoken_check.returncode != 0:
+        raise RuntimeError("base benchmark environment cannot import tiktoken from the current CI environment")
+    if not install_legacy_yaml:
+        return python_exe
+    yaml_check = subprocess.run([str(python_exe), "-c", "import yaml"], cwd=str(project), stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    requirements = project / "requirements-ci.txt"
+    if yaml_check.returncode != 0 and requirements.exists():
+        pyyaml_requirement = ""
+        for line in requirements.read_text(encoding="utf-8").splitlines():
+            if line.strip().lower().startswith("pyyaml"):
+                pyyaml_requirement = line.strip()
+                break
+        if not pyyaml_requirement:
+            return python_exe
+        result = subprocess.run(
+            [str(python_exe), "-m", "pip", "install", pyyaml_requirement],
+            cwd=str(project),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"failed to install benchmark environment for {project}:\n{result.stdout}\n{result.stderr}")
+    return python_exe
+
+
+def _python_cli_command(project: Path, python_executable: Path | None = None) -> list[str]:
+    python_executable = python_executable or Path(sys.executable)
     script = project / "token_optimizer.py"
     if script.exists():
-        return [sys.executable, str(script)]
-    return [sys.executable, "-c", "from cida.interfaces.cli import main; main()"]
+        return [str(python_executable), str(script)]
+    return [str(python_executable), "-c", "from cida.interfaces.cli import main; main()"]
 
 
 def _process_rss_bytes(pid: int) -> int:
@@ -144,7 +196,11 @@ def _read_report_entries(destination: Path) -> list[dict]:
         data = json.loads(report.read_text(encoding="utf-8"))
     except Exception:
         return []
-    return data if isinstance(data, list) else []
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict) and isinstance(data.get("entries"), list):
+        return data["entries"]
+    return []
 
 
 def _read_report_tokens(destination: Path) -> int:
@@ -178,7 +234,7 @@ def _supports_flag(project: Path, command: list[str], flag: str) -> bool:
     return flag in result.stdout or flag in result.stderr
 
 
-def _measure(command: list[str], project: Path, source: Path, destination: Path, flags: list[str]) -> dict:
+def _measure(command: list[str], project: Path, source: Path, destination: Path, flags: list[str], python_bin_dir: Path | None = None) -> dict:
     if destination.exists():
         shutil.rmtree(destination)
     destination.mkdir(parents=True)
@@ -197,6 +253,8 @@ def _measure(command: list[str], project: Path, source: Path, destination: Path,
     start = time.perf_counter()
     env = os.environ.copy()
     env["TIKTOKEN_CACHE_DIR"] = str(project / "resources")
+    if python_bin_dir is not None:
+        env["PATH"] = str(python_bin_dir) + os.pathsep + env.get("PATH", "")
     proc = subprocess.Popen(
         cmd,
         cwd=str(project),
@@ -400,8 +458,12 @@ def main() -> None:
         }
 
         failed = []
-        base_python_cmd = _python_cli_command(base_dir)
-        head_python_cmd = _python_cli_command(head_dir)
+        base_python = _prepare_python_env(base_dir, temp_root / "base-venv", install_legacy_yaml=True)
+        base_python_bin = _python_bin_dir(base_python)
+        base_python_cmd = _python_cli_command(base_dir, base_python)
+        head_python = _prepare_python_env(head_dir, temp_root / "head-venv")
+        head_python_bin = _python_bin_dir(head_python)
+        head_python_cmd = _python_cli_command(head_dir, head_python)
         base_supports_no_cache = _supports_flag(base_dir, base_python_cmd, "--no-cache")
         base_supports_val_level = _supports_flag(base_dir, base_python_cmd, "--validation-level")
 
@@ -425,8 +487,8 @@ def main() -> None:
             durable_writes = "--durable-writes" in flags
 
             version_configs = [
-                ("base", base_bin, base_dir),
-                ("head", head_bin, head_dir),
+                ("base", base_bin, base_dir, base_python_bin),
+                ("head", head_bin, head_dir, head_python_bin),
             ]
 
             unsupported_base_flags: list[str] = []
@@ -458,21 +520,21 @@ def main() -> None:
                 # Warmups: alternating order.
                 for w in range(args.warmups):
                     warmup_order = version_configs if w % 2 == 0 else list(reversed(version_configs))
-                    for version, binary, _project in warmup_order:
+                    for version, binary, _project, python_bin in warmup_order:
                         command = [str(binary)] if runner == "go" else (base_python_cmd if version == "base" else head_python_cmd)
                         effective_flags = build_effective_flags(version)
                         dest = temp_root / "runs" / scenario_name / f"attempt-{attempt:02d}" / version / f"warmup-{w:02d}"
-                        _measure(command, _project, source, dest, effective_flags)
+                        _measure(command, _project, source, dest, effective_flags, python_bin)
 
                 # Measured runs: alternating order.
                 for r in range(args.runs):
                     run_order = version_configs if r % 2 == 0 else list(reversed(version_configs))
-                    for version, binary, _project in run_order:
+                    for version, binary, _project, python_bin in run_order:
                         command = [str(binary)] if runner == "go" else (base_python_cmd if version == "base" else head_python_cmd)
                         effective_flags = build_effective_flags(version)
                         dest = temp_root / "runs" / scenario_name / f"attempt-{attempt:02d}" / version / f"run-{r:02d}"
 
-                        sample = _measure(command, _project, source, dest, effective_flags)
+                        sample = _measure(command, _project, source, dest, effective_flags, python_bin)
                         samples_map[version].append(sample)
                         hashes_map[version].append(_compute_tree_sha256(dest))
 

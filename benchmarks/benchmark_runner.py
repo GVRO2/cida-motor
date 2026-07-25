@@ -135,7 +135,8 @@ def main():
             sys.exit(1)
 
         with open(report_json_path, 'r', encoding='utf-8') as f:
-            entries = json.load(f)
+            report_payload = json.load(f)
+        entries = report_payload.get("entries", []) if isinstance(report_payload, dict) else report_payload
 
         for e in entries:
             # Verify relative path is used

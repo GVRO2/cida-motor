@@ -21,7 +21,7 @@ class JsonCodec(Protocol):
     def canonical_encode(self, data: Any) -> str:
         ...
 
-class YamlCodec(Protocol):
+class FrontmatterCodec(Protocol):
     def decode(self, content: str) -> dict:
         ...
 
