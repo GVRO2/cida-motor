@@ -16,6 +16,7 @@ from cida.infrastructure.hashing import HashService
 from cida.infrastructure.json_codec import JsonCodec
 from cida.application.optimize_file import FileOptimizerUsecase
 from cida.application.optimize_corpus import CorpusOptimizerUsecase
+from cida.application.selective_alias_resolution import SelectiveAliasResolver
 from cida.application.generate_report import ReportGeneratorUsecase
 from cida.domain.processing_context import ProcessingContext
 from cida.markdown.protected_regions import ProtectedRegionsManager
@@ -232,6 +233,7 @@ def translate_main():
     try:
         file_repo = PhysicalFilesystem()
         json_codec = JsonCodec()
+        hash_service = HashService()
 
         if len(sys.argv) < 2:
             print("Usage: translate.py [--sidecar <file.cidatkn>] [--source <source_file>] [--path <dir>] <alias1> [alias2 ...]", file=sys.stderr)
@@ -293,21 +295,15 @@ def translate_main():
                 print(f"Error: Sidecar directory '{sidecar_dir}' not found.", file=sys.stderr)
                 sys.exit(5)
 
-            for file in sorted(file_repo.list_dir(sidecar_dir)):
-                if file.endswith(".cidatkn"):
-                    try:
-                        data = json_codec.decode(file_repo.read_text(os.path.join(sidecar_dir, file)))
-                        if isinstance(data, dict) and "entries" in data:
-                            for alias, val in data["entries"].items():
-                                if alias in mapping and mapping[alias] != val:
-                                    print(f"Error: Alias collision detected for '{alias}' across sidecars without explicit sidecar context.", file=sys.stderr)
-                                    sys.exit(1)
-                                mapping[alias] = val
-                    except Exception as e:
-                        if isinstance(e, CidaError):
-                            raise
-                        print(f"Error reading dictionary {file}: {e}", file=sys.stderr)
-                        sys.exit(5)
+            try:
+                resolver = SelectiveAliasResolver(file_repo, json_codec, hash_service)
+                resolution = resolver.resolve(set(tokens_to_translate), sidecar_dir)
+                mapping = resolution.resolved
+            except CidaError:
+                raise
+            except Exception as e:
+                print(f"Error reading dictionary: {e}", file=sys.stderr)
+                sys.exit(5)
 
         results = {}
         for t in tokens_to_translate:

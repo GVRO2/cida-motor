@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import pytest
 from unittest.mock import MagicMock, patch
 from cida.domain.errors import TokenizerError
@@ -93,6 +94,13 @@ class MagicCounter:
         self.calls.append(text)
         return self.counts[text]
 
+
+def _sidecar_json(entries):
+    return (
+        '{"format": "cida-token-sidecar", "version": 1, "source": "corpus", '
+        '"source_sha256": "' + ("a" * 64) + '", "entries": ' + json.dumps(entries) + "}"
+    )
+
 def test_translate_main_no_args():
     with patch.object(sys, "argv", ["translate.py"]), \
          pytest.raises(SystemExit) as exc:
@@ -109,7 +117,7 @@ def test_translate_main_with_valid_sidecar(tmp_path):
     sidecar_dir = tmp_path / "sidecar"
     sidecar_dir.mkdir()
     sidecar_file = sidecar_dir / "test.cidatkn"
-    sidecar_file.write_text('{"entries": {"AA": "hello"}}')
+    sidecar_file.write_text(_sidecar_json({"AA": "hello"}))
 
     with patch.object(sys, "argv", ["translate.py", "AA", "BB", "--path", str(sidecar_dir)]), \
          patch("builtins.print") as mock_print:
@@ -173,14 +181,14 @@ def test_translate_main_missing_source_sidecar(tmp_path):
 def test_translate_main_alias_collision_requires_explicit_sidecar(tmp_path):
     sidecar_dir = tmp_path / "sidecar"
     sidecar_dir.mkdir()
-    (sidecar_dir / "a.cidatkn").write_text('{"entries": {"AA": "hello"}}', encoding="utf-8")
-    (sidecar_dir / "b.cidatkn").write_text('{"entries": {"AA": "world"}}', encoding="utf-8")
+    (sidecar_dir / "a.cidatkn").write_text(_sidecar_json({"AA": "hello"}), encoding="utf-8")
+    (sidecar_dir / "b.cidatkn").write_text(_sidecar_json({"AA": "world"}), encoding="utf-8")
 
     with patch.object(sys, "argv", ["translate.py", "AA", "--path", str(sidecar_dir)]), \
          pytest.raises(SystemExit) as exc:
         translate_main()
 
-    assert exc.value.code == 1
+    assert exc.value.code == 5
 
 
 def test_translate_main_corrupted_sidecar(tmp_path):

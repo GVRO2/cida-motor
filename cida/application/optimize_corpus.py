@@ -1,4 +1,5 @@
 from cida.application.ports import TokenCounter, FileRepository, HashService, JsonCodec, DictionaryBuilder
+from cida.application.selective_alias_resolution import ALIAS_INDEX_FILENAME, build_alias_index
 from cida.domain.errors import SourcePathError, InternalProcessingError
 from cida.domain.policies import is_binary_extension
 from cida.domain.processing_context import FileInventory
@@ -114,6 +115,8 @@ class CorpusOptimizerUsecase:
         items = list(corpus_dict.items())
         tknd_dir = self.file_repo.join(dst_abs, "tknd")
         self.file_repo.makedirs(tknd_dir)
+        alias_to_chunk = {}
+        chunk_hashes = {}
         for i in range(0, len(items), 500):
             chunk = items[i:i+500]
             prefixChars = "ABCDEF"
@@ -126,5 +129,20 @@ class CorpusOptimizerUsecase:
                 "source_sha256": corpus_hash,
                 "entries": entries_map
             }
-            dict_file_path = self.file_repo.join(tknd_dir, f"{start_id}.cidatkn")
-            self.file_repo.write_text(dict_file_path, self.json_codec.encode(sidecar_data, indent=4))
+            chunk_filename = f"{start_id}.cidatkn"
+            dict_file_path = self.file_repo.join(tknd_dir, chunk_filename)
+            serialized = self.json_codec.encode(sidecar_data, indent=4)
+            self.file_repo.write_text(dict_file_path, serialized)
+            chunk_hashes[chunk_filename] = self.hash_service.sha256(serialized.encode("utf-8"))
+            for alias in entries_map:
+                alias_to_chunk[alias] = chunk_filename
+
+        index_data = build_alias_index(
+            alias_to_chunk=alias_to_chunk,
+            dictionary_id=corpus_hash,
+            chunk_hashes=chunk_hashes,
+            hash_service=self.hash_service,
+            json_codec=self.json_codec,
+        )
+        index_path = self.file_repo.join(tknd_dir, ALIAS_INDEX_FILENAME)
+        self.file_repo.write_text(index_path, self.json_codec.encode(index_data, indent=4))
