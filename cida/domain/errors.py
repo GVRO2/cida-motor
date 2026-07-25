@@ -14,6 +14,10 @@ class SemanticValidationError(CidaError):
     """Raised when semantic/structural comparison checks fail."""
     exit_code = 3
 
+class UnsupportedFrontmatterSyntaxError(SemanticValidationError, ValueError):
+    """Raised when frontmatter uses syntax outside CIDA's supported subset."""
+    pass
+
 class EncodingValidationError(CidaError):
     """Raised when file text decoding fails strict encoding validation."""
     exit_code = 3
@@ -33,4 +37,3 @@ class ReconstructionError(CidaError):
 class InternalProcessingError(CidaError):
     """Raised for unexpected processing errors or file-specific errors."""
     exit_code = 6
-
