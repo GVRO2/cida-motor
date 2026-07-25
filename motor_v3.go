@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -251,6 +252,8 @@ func main() {
 	resourceProfileExplicit := false
 	requestedWorkers := 0
 	workersExplicit := false
+	requestedMaxPythonProcesses := 0
+	maxPythonProcessesExplicit := false
 
 	// Parse flags manually to preserve existing go run motor_v3.go <src> [dst] syntax
 	args := os.Args[1:]
@@ -306,6 +309,23 @@ func main() {
 			}
 			requestedWorkers = parsed
 			workersExplicit = true
+			i++
+		} else if strings.HasPrefix(arg, "--max-python-processes=") {
+			parsed, err := strconv.Atoi(strings.TrimPrefix(arg, "--max-python-processes="))
+			if err != nil {
+				fmt.Printf("❌ Erro: --max-python-processes deve ser inteiro: %s\n", strings.TrimPrefix(arg, "--max-python-processes="))
+				os.Exit(1)
+			}
+			requestedMaxPythonProcesses = parsed
+			maxPythonProcessesExplicit = true
+		} else if arg == "--max-python-processes" && i+1 < len(args) {
+			parsed, err := strconv.Atoi(args[i+1])
+			if err != nil {
+				fmt.Printf("❌ Erro: --max-python-processes deve ser inteiro: %s\n", args[i+1])
+				os.Exit(1)
+			}
+			requestedMaxPythonProcesses = parsed
+			maxPythonProcessesExplicit = true
 			i++
 		} else if strings.HasPrefix(arg, "--mode=") {
 			mode = strings.TrimPrefix(arg, "--mode=")
@@ -373,7 +393,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	resources, resourceErr := detectResourceSettings(resourceProfile, resourceProfileExplicit, requestedWorkers, workersExplicit)
+	resources, resourceErr := detectResourceSettings(resourceProfile, resourceProfileExplicit, requestedWorkers, workersExplicit, requestedMaxPythonProcesses, maxPythonProcessesExplicit)
 	if resourceErr != nil {
 		fmt.Printf("Error: %s\n", resourceErr)
 		os.Exit(1)
@@ -463,6 +483,7 @@ func main() {
 
 	fmt.Printf("Logical CPUs: %d\n", resources.LogicalCPUs)
 	fmt.Printf("GOMAXPROCS: %d\n", resources.GOMAXPROCS)
+	fmt.Printf("Effective CPU capacity: %d\n", resources.EffectiveCPUCapacity)
 	fmt.Printf("Resource profile: %s\n", resources.Profile)
 	if resources.RequestedWorkers == nil {
 		fmt.Println("Requested workers: <none>")
@@ -470,7 +491,11 @@ func main() {
 		fmt.Printf("Requested workers: %d\n", *resources.RequestedWorkers)
 	}
 	fmt.Printf("Effective workers: %d\n", resources.EffectiveWorkers)
+	fmt.Printf("Max Python processes: %d\n", resources.MaxPythonProcesses)
 	fmt.Printf("Resolution source: %s\n", resources.ResolutionSource)
+	if resources.ClampReason != "" {
+		fmt.Printf("Clamp reason: %s\n", resources.ClampReason)
+	}
 
 	if isWatcher {
 		fmt.Println("👀 Modo Watcher ativado. Pressione Ctrl+C para sair.")
@@ -711,21 +736,21 @@ func processarEComparar(pastaOrig string, pastaComp string, mode string, modeExp
 		for idx, fp := range javaFiles {
 			javaJobs = append(javaJobs, Job[string]{Index: idx, Value: fp})
 		}
-		poolResults := RunPoolWithOptions(context.Background(), resources.EffectiveWorkers, javaJobs, func(ctx context.Context, fp string) (fileInfo, error) {
+		poolOutcome := RunPoolOutcomeWithOptions(context.Background(), resources.EffectiveWorkers, javaJobs, func(ctx context.Context, fp string) (fileInfo, error) {
 			relPath, err := filepath.Rel(absOrig, fp)
 			if err != nil {
-				return fileInfo{}, fmt.Errorf("erro ao calcular caminho relativo para %s: %w", fp, err)
+				return fileInfo{}, &SourceIOProcessingError{Path: fp, Err: fmt.Errorf("erro ao calcular caminho relativo: %w", err)}
 			}
 			destPath := filepath.Join(absComp, relPath) + ".tknc"
 
 			contentBytes, err := os.ReadFile(fp)
 			if err != nil {
-				return fileInfo{}, fmt.Errorf("erro ao ler arquivo Java %s: %w", fp, err)
+				return fileInfo{}, &SourceIOProcessingError{Path: fp, Err: fmt.Errorf("erro ao ler arquivo Java: %w", err)}
 			}
 			contentStr := string(contentBytes)
 			origTok, err := estimarTokensContext(ctx, contentStr)
 			if err != nil {
-				return fileInfo{}, fmt.Errorf("erro no tokenizer ao processar original %s: %w", fp, err)
+				return fileInfo{}, &TokenizerProcessingError{Path: fp, Err: fmt.Errorf("erro no tokenizer ao processar original: %w", err)}
 			}
 
 			start := time.Now()
@@ -734,7 +759,7 @@ func processarEComparar(pastaOrig string, pastaComp string, mode string, modeExp
 
 			miniTok, err := estimarTokensContext(ctx, minified)
 			if err != nil {
-				return fileInfo{}, fmt.Errorf("erro no tokenizer ao processar minificado %s: %w", fp, err)
+				return fileInfo{}, &TokenizerProcessingError{Path: fp, Err: fmt.Errorf("erro no tokenizer ao processar minificado: %w", err)}
 			}
 
 			return fileInfo{
@@ -748,11 +773,11 @@ func processarEComparar(pastaOrig string, pastaComp string, mode string, modeExp
 			}, nil
 		}, PoolOptions{ContinueOnError: continueOnError})
 
-		for _, result := range poolResults {
+		for _, result := range poolOutcome.Results {
 			if result.Err != nil {
 				fmt.Fprintf(os.Stderr, "Error processing Java file: %v\n", result.Err)
 				if !continueOnError {
-					os.Exit(exitCodeForJavaProcessingError(result.Err))
+					os.Exit(exitCodeForJavaProcessingError(poolOutcome.RootError))
 				}
 				continue
 			}
@@ -973,8 +998,10 @@ func processarEComparar(pastaOrig string, pastaComp string, mode string, modeExp
 		}
 		pyArgs = append(pyArgs, "--resource-profile", resources.Profile)
 		pyArgs = append(pyArgs, "--workers", strconv.Itoa(resources.EffectiveWorkers))
+		pyArgs = append(pyArgs, "--max-python-processes", strconv.Itoa(resources.MaxPythonProcesses))
 		pyArgs = append(pyArgs, "--logical-cpus", strconv.Itoa(resources.LogicalCPUs))
 		pyArgs = append(pyArgs, "--gomaxprocs", strconv.Itoa(resources.GOMAXPROCS))
+		pyArgs = append(pyArgs, "--effective-cpu-capacity", strconv.Itoa(resources.EffectiveCPUCapacity))
 		pyArgs = append(pyArgs, "--resource-resolution-source", resources.ResolutionSource)
 		if resources.RequestedWorkers != nil {
 			pyArgs = append(pyArgs, "--requested-workers", strconv.Itoa(*resources.RequestedWorkers))
@@ -1315,15 +1342,18 @@ const (
 )
 
 type ResourceSettings struct {
-	LogicalCPUs      int    `json:"logical_cpus"`
-	GOMAXPROCS       int    `json:"gomaxprocs"`
-	Profile          string `json:"profile"`
-	RequestedWorkers *int   `json:"requested_workers"`
-	EffectiveWorkers int    `json:"effective_workers"`
-	ResolutionSource string `json:"resolution_source"`
+	LogicalCPUs          int    `json:"logical_cpus"`
+	GOMAXPROCS           int    `json:"gomaxprocs"`
+	EffectiveCPUCapacity int    `json:"effective_cpu_capacity"`
+	Profile              string `json:"profile"`
+	RequestedWorkers     *int   `json:"requested_workers"`
+	EffectiveWorkers     int    `json:"effective_workers"`
+	MaxPythonProcesses   int    `json:"max_python_processes"`
+	ResolutionSource     string `json:"resolution_source"`
+	ClampReason          string `json:"clamp_reason,omitempty"`
 }
 
-func resolveResourceSettings(profile string, profileExplicit bool, requestedWorkers int, workersExplicit bool, numCPU func() int, gomaxprocs func() int) (ResourceSettings, error) {
+func resolveResourceSettings(profile string, profileExplicit bool, requestedWorkers int, workersExplicit bool, requestedMaxPythonProcesses int, maxPythonProcessesExplicit bool, numCPU func() int, gomaxprocs func() int) (ResourceSettings, error) {
 	logicalCPUs := numCPU()
 	if logicalCPUs < 1 {
 		logicalCPUs = 1
@@ -1332,17 +1362,26 @@ func resolveResourceSettings(profile string, profileExplicit bool, requestedWork
 	if gmp < 1 {
 		gmp = 1
 	}
+	effectiveCPUCapacity := minInt(logicalCPUs, gmp)
+	if effectiveCPUCapacity < 1 {
+		effectiveCPUCapacity = 1
+	}
 
 	settings := ResourceSettings{
-		LogicalCPUs:      logicalCPUs,
-		GOMAXPROCS:       gmp,
-		Profile:          "default",
-		EffectiveWorkers: defaultWorkerCount,
-		ResolutionSource: "default",
+		LogicalCPUs:          logicalCPUs,
+		GOMAXPROCS:           gmp,
+		EffectiveCPUCapacity: effectiveCPUCapacity,
+		Profile:              "default",
+		EffectiveWorkers:     defaultWorkerCount,
+		ResolutionSource:     "default",
+	}
+	if gmp < logicalCPUs && settings.EffectiveWorkers > effectiveCPUCapacity {
+		settings.EffectiveWorkers = effectiveCPUCapacity
+		settings.ClampReason = "gomaxprocs"
 	}
 
 	if profileExplicit {
-		workers, err := workersForProfile(profile, logicalCPUs)
+		workers, err := workersForProfile(profile, effectiveCPUCapacity)
 		if err != nil {
 			return settings, err
 		}
@@ -1364,15 +1403,29 @@ func resolveResourceSettings(profile string, profileExplicit bool, requestedWork
 		}
 	}
 
+	if maxPythonProcessesExplicit {
+		if requestedMaxPythonProcesses < minWorkerCount || requestedMaxPythonProcesses > maxWorkerCount {
+			return settings, fmt.Errorf("--max-python-processes must be between %d and %d", minWorkerCount, maxWorkerCount)
+		}
+		settings.MaxPythonProcesses = minInt(requestedMaxPythonProcesses, settings.EffectiveWorkers)
+	} else {
+		settings.MaxPythonProcesses = minInt(settings.EffectiveWorkers, minInt(4, effectiveCPUCapacity))
+	}
+	if settings.MaxPythonProcesses < 1 {
+		settings.MaxPythonProcesses = 1
+	}
+
 	return settings, nil
 }
 
-func detectResourceSettings(profile string, profileExplicit bool, requestedWorkers int, workersExplicit bool) (ResourceSettings, error) {
+func detectResourceSettings(profile string, profileExplicit bool, requestedWorkers int, workersExplicit bool, requestedMaxPythonProcesses int, maxPythonProcessesExplicit bool) (ResourceSettings, error) {
 	return resolveResourceSettings(
 		profile,
 		profileExplicit,
 		requestedWorkers,
 		workersExplicit,
+		requestedMaxPythonProcesses,
+		maxPythonProcessesExplicit,
 		runtime.NumCPU,
 		func() int { return runtime.GOMAXPROCS(0) },
 	)
@@ -1386,9 +1439,9 @@ func workersForProfile(profile string, logicalCPUs int) (int, error) {
 	case "light":
 		return clampWorkers(maxInt(1, minInt(4, logicalCPUs/2))), nil
 	case "medium":
-		return clampWorkers(minInt(10, maxInt(2, logicalCPUs))), nil
+		return clampWorkers(minInt(10, maxInt(1, logicalCPUs))), nil
 	case "hard":
-		return clampWorkers(minInt(64, maxInt(10, logicalCPUs*2))), nil
+		return clampWorkers(minInt(64, maxInt(1, logicalCPUs*2))), nil
 	default:
 		return 0, fmt.Errorf("invalid resource profile: %s", profile)
 	}
@@ -1419,14 +1472,64 @@ func maxInt(a int, b int) int {
 }
 
 func exitCodeForJavaProcessingError(err error) int {
-	message := strings.ToLower(err.Error())
-	if strings.Contains(message, "tokenizer") {
+	if err == nil {
+		return 6
+	}
+	var tokenizerErr *TokenizerProcessingError
+	if errors.As(err, &tokenizerErr) {
 		return 2
 	}
-	if strings.Contains(message, "caminho") || strings.Contains(message, "ler arquivo") {
+	var sourceErr *SourceIOProcessingError
+	if errors.As(err, &sourceErr) {
 		return 4
 	}
+	var panicErr *WorkerPanicError
+	if errors.As(err, &panicErr) {
+		return 6
+	}
 	return 6
+}
+
+type TokenizerProcessingError struct {
+	Path string
+	Err  error
+}
+
+func (err *TokenizerProcessingError) Error() string {
+	return fmt.Sprintf("tokenizer error for %s: %v", err.Path, err.Err)
+}
+
+func (err *TokenizerProcessingError) Unwrap() error {
+	return err.Err
+}
+
+type SourceIOProcessingError struct {
+	Path string
+	Err  error
+}
+
+func (err *SourceIOProcessingError) Error() string {
+	return fmt.Sprintf("source I/O error for %s: %v", err.Path, err.Err)
+}
+
+func (err *SourceIOProcessingError) Unwrap() error {
+	return err.Err
+}
+
+type WorkerPanicError struct {
+	Value any
+}
+
+func (err *WorkerPanicError) Error() string {
+	return fmt.Sprintf("worker panic: %v", err.Value)
+}
+
+type PoolConfigurationError struct {
+	Message string
+}
+
+func (err *PoolConfigurationError) Error() string {
+	return err.Message
 }
 
 type Job[T any] struct {
@@ -1438,6 +1541,11 @@ type Result[R any] struct {
 	Index int
 	Value R
 	Err   error
+}
+
+type PoolOutcome[R any] struct {
+	Results   []Result[R]
+	RootError error
 }
 
 type PoolOptions struct {
@@ -1460,6 +1568,16 @@ func RunPoolWithOptions[T any, R any](
 	fn func(context.Context, T) (R, error),
 	options PoolOptions,
 ) []Result[R] {
+	return RunPoolOutcomeWithOptions(ctx, workers, jobs, fn, options).Results
+}
+
+func RunPoolOutcomeWithOptions[T any, R any](
+	ctx context.Context,
+	workers int,
+	jobs []Job[T],
+	fn func(context.Context, T) (R, error),
+	options PoolOptions,
+) PoolOutcome[R] {
 	if workers < 1 {
 		workers = 1
 	}
@@ -1468,45 +1586,83 @@ func RunPoolWithOptions[T any, R any](
 	}
 
 	results := make([]Result[R], len(jobs))
+	if err := validateJobs(jobs); err != nil {
+		for position, job := range jobs {
+			results[position] = Result[R]{Index: job.Index, Err: err}
+		}
+		return PoolOutcome[R]{Results: results, RootError: err}
+	}
 	if len(jobs) == 0 {
-		return results
+		return PoolOutcome[R]{Results: results}
 	}
 
 	poolCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	jobCh := make(chan Job[T])
+	type queuedJob struct {
+		position int
+		job      Job[T]
+	}
+
+	jobCh := make(chan queuedJob)
 	var wg sync.WaitGroup
+	var rootMu sync.Mutex
+	var rootError error
+
+	recordRootError := func(err error) {
+		if err == nil {
+			return
+		}
+		rootMu.Lock()
+		defer rootMu.Unlock()
+		if shouldPromoteRootError(err, rootError) {
+			rootError = err
+		}
+	}
 
 	for workerID := 0; workerID < workers; workerID++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for job := range jobCh {
+			for queued := range jobCh {
+				job := queued.job
+				position := queued.position
 				if poolCtx.Err() != nil && !options.ContinueOnError {
-					results[job.Index] = Result[R]{Index: job.Index, Err: poolCtx.Err()}
+					results[position] = Result[R]{Index: job.Index, Err: poolCtx.Err()}
 					continue
 				}
 				value, err := runPoolJob(poolCtx, job.Value, fn)
-				results[job.Index] = Result[R]{Index: job.Index, Value: value, Err: err}
+				results[position] = Result[R]{Index: job.Index, Value: value, Err: err}
 				if err != nil && !options.ContinueOnError {
+					recordRootError(err)
 					cancel()
+				} else if err != nil {
+					recordRootError(err)
 				}
 			}
 		}()
 	}
 
-	for _, job := range jobs {
+	for position, job := range jobs {
 		if poolCtx.Err() != nil && !options.ContinueOnError {
-			results[job.Index] = Result[R]{Index: job.Index, Err: poolCtx.Err()}
+			results[position] = Result[R]{Index: job.Index, Err: poolCtx.Err()}
 			continue
 		}
-		jobCh <- job
+		select {
+		case jobCh <- queuedJob{position: position, job: job}:
+		case <-poolCtx.Done():
+			if !options.ContinueOnError {
+				results[position] = Result[R]{Index: job.Index, Err: poolCtx.Err()}
+			}
+		}
 	}
 	close(jobCh)
 	wg.Wait()
 
-	return results
+	rootMu.Lock()
+	finalRootError := rootError
+	rootMu.Unlock()
+	return PoolOutcome[R]{Results: results, RootError: finalRootError}
 }
 
 func runPoolJob[T any, R any](
@@ -1516,8 +1672,40 @@ func runPoolJob[T any, R any](
 ) (result R, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("worker panic: %v", recovered)
+			err = &WorkerPanicError{Value: recovered}
 		}
 	}()
 	return fn(ctx, value)
+}
+
+func validateJobs[T any](jobs []Job[T]) error {
+	seen := make(map[int]struct{}, len(jobs))
+	for _, job := range jobs {
+		if job.Index < 0 || job.Index >= len(jobs) {
+			return &PoolConfigurationError{Message: fmt.Sprintf("invalid job index %d for %d jobs", job.Index, len(jobs))}
+		}
+		if _, exists := seen[job.Index]; exists {
+			return &PoolConfigurationError{Message: fmt.Sprintf("duplicate job index %d", job.Index)}
+		}
+		seen[job.Index] = struct{}{}
+	}
+	return nil
+}
+
+func shouldPromoteRootError(candidate error, current error) bool {
+	if candidate == nil {
+		return false
+	}
+	if current == nil {
+		return true
+	}
+	candidateCanceled := errors.Is(candidate, context.Canceled)
+	currentCanceled := errors.Is(current, context.Canceled)
+	if currentCanceled && !candidateCanceled {
+		return true
+	}
+	if candidateCanceled && !currentCanceled {
+		return false
+	}
+	return false
 }

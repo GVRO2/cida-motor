@@ -1,7 +1,13 @@
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from cida.domain.errors import SemanticValidationError, UnsupportedFrontmatterSyntaxError
+
+
+@dataclass
+class ParseState:
+    key_count: int = 0
 
 
 class FrontmatterCodec:
@@ -11,18 +17,15 @@ class FrontmatterCodec:
     max_keys = 1024
     max_bytes = 1024 * 1024
 
-    def __init__(self) -> None:
-        self._key_count = 0
-
     def decode(self, content: str) -> dict:
         try:
-            self._key_count = 0
+            state = ParseState()
             if content.strip() == "---":
                 return {}
             lines = self._prepare_lines(content)
             if not any(line.strip() for line in lines):
                 return {}
-            value, index = self._parse_mapping(lines, 0, 0)
+            value, index = self._parse_mapping(lines, 0, 0, state)
             if index != len(lines):
                 raise UnsupportedFrontmatterSyntaxError(f"Invalid indentation at line {index + 1}")
             return value
@@ -72,7 +75,7 @@ class FrontmatterCodec:
             prepared.append(stripped.rstrip())
         return prepared
 
-    def _parse_mapping(self, lines: list[str], index: int, indent: int) -> tuple[dict, int]:
+    def _parse_mapping(self, lines: list[str], index: int, indent: int, state: ParseState) -> tuple[dict, int]:
         self._check_depth(indent)
         result: dict[str, Any] = {}
         while index < len(lines):
@@ -94,9 +97,7 @@ class FrontmatterCodec:
                 raise UnsupportedFrontmatterSyntaxError("Merge keys are not supported")
             if key in result:
                 raise UnsupportedFrontmatterSyntaxError(f"Duplicate key '{key}' found in YAML frontmatter")
-            self._key_count += 1
-            if self._key_count > self.max_keys:
-                raise UnsupportedFrontmatterSyntaxError("Frontmatter exceeds maximum key count")
+            self._record_key(state)
 
             if raw_value == "":
                 next_index = index + 1
@@ -107,9 +108,9 @@ class FrontmatterCodec:
                 next_text = lines[next_index].lstrip()
                 value: Any
                 if next_text == "-" or next_text.startswith("- "):
-                    value, index = self._parse_list(lines, next_index, self._indent_of(lines[next_index]))
+                    value, index = self._parse_list(lines, next_index, self._indent_of(lines[next_index]), state)
                 else:
-                    value, index = self._parse_mapping(lines, next_index, self._indent_of(lines[next_index]))
+                    value, index = self._parse_mapping(lines, next_index, self._indent_of(lines[next_index]), state)
                 result[key] = value
                 continue
 
@@ -117,7 +118,7 @@ class FrontmatterCodec:
             index += 1
         return result, index
 
-    def _parse_list(self, lines: list[str], index: int, indent: int) -> tuple[list, int]:
+    def _parse_list(self, lines: list[str], index: int, indent: int, state: ParseState) -> tuple[list, int]:
         self._check_depth(indent)
         result: list[Any] = []
         while index < len(lines):
@@ -137,12 +138,29 @@ class FrontmatterCodec:
                     result.append(None)
                     index += 1
                     continue
-                value, index = self._parse_mapping(lines, next_index, self._indent_of(lines[next_index]))
+                next_text = lines[next_index].lstrip()
+                value: Any
+                if next_text == "-" or next_text.startswith("- "):
+                    value, index = self._parse_list(lines, next_index, self._indent_of(lines[next_index]), state)
+                else:
+                    value, index = self._parse_mapping(lines, next_index, self._indent_of(lines[next_index]), state)
                 result.append(value)
                 continue
             if ":" in raw_value and not raw_value.startswith(("'", '"', "[", "{")):
                 key, value_text = self._split_key_value(raw_value, index + 1)
+                self._record_key(state)
                 item: dict[str, Any] = {key: self._parse_scalar_or_inline(value_text, index + 1) if value_text else None}
+                next_index = index + 1
+                if next_index < len(lines) and self._indent_of(lines[next_index]) > current_indent:
+                    continuation, index = self._parse_mapping(lines, next_index, self._indent_of(lines[next_index]), state)
+                    for nested_key, nested_value in continuation.items():
+                        if nested_key in item:
+                            raise UnsupportedFrontmatterSyntaxError(
+                                f"Duplicate key '{nested_key}' found in YAML frontmatter"
+                            )
+                        item[nested_key] = nested_value
+                    result.append(item)
+                    continue
                 result.append(item)
             else:
                 result.append(self._parse_scalar_or_inline(raw_value, index + 1))
@@ -223,10 +241,69 @@ class FrontmatterCodec:
         inner = value[1:-1]
         if quote == "'":
             return inner.replace("''", "'")
-        try:
-            return bytes(inner, "utf-8").decode("unicode_escape")
-        except UnicodeDecodeError as exc:
-            raise UnsupportedFrontmatterSyntaxError(f"Invalid escape at line {line_no}") from exc
+        return self._decode_double_quoted(inner, line_no)
+
+    def _decode_double_quoted(self, value: str, line_no: int) -> str:
+        escapes = {
+            '"': '"',
+            "\\": "\\",
+            "n": "\n",
+            "r": "\r",
+            "t": "\t",
+            "b": "\b",
+            "f": "\f",
+        }
+        decoded: list[str] = []
+        index = 0
+        while index < len(value):
+            char = value[index]
+            if char != "\\":
+                decoded.append(char)
+                index += 1
+                continue
+
+            if index + 1 >= len(value):
+                raise UnsupportedFrontmatterSyntaxError(f"Trailing backslash in quoted string at line {line_no}")
+            escape = value[index + 1]
+            if escape in escapes:
+                decoded.append(escapes[escape])
+                index += 2
+                continue
+            if escape == "u":
+                codepoint, index = self._decode_unicode_escape(value, index, 4, line_no)
+                if 0xD800 <= codepoint <= 0xDBFF:
+                    if not value.startswith("\\u", index):
+                        raise UnsupportedFrontmatterSyntaxError(f"Invalid surrogate pair at line {line_no}")
+                    low, index = self._decode_unicode_escape(value, index, 4, line_no)
+                    if not 0xDC00 <= low <= 0xDFFF:
+                        raise UnsupportedFrontmatterSyntaxError(f"Invalid surrogate pair at line {line_no}")
+                    codepoint = 0x10000 + ((codepoint - 0xD800) << 10) + (low - 0xDC00)
+                elif 0xDC00 <= codepoint <= 0xDFFF:
+                    raise UnsupportedFrontmatterSyntaxError(f"Invalid surrogate pair at line {line_no}")
+                decoded.append(chr(codepoint))
+                continue
+            if escape == "U":
+                codepoint, index = self._decode_unicode_escape(value, index, 8, line_no)
+                if codepoint > 0x10FFFF or 0xD800 <= codepoint <= 0xDFFF:
+                    raise UnsupportedFrontmatterSyntaxError(f"Invalid Unicode escape at line {line_no}")
+                decoded.append(chr(codepoint))
+                continue
+            raise UnsupportedFrontmatterSyntaxError(f"Unsupported escape \\{escape} at line {line_no}")
+        return "".join(decoded)
+
+    def _decode_unicode_escape(self, value: str, slash_index: int, digits: int, line_no: int) -> tuple[int, int]:
+        escape_type = value[slash_index + 1]
+        start = slash_index + 2
+        end = start + digits
+        if end > len(value):
+            raise UnsupportedFrontmatterSyntaxError(f"Incomplete Unicode escape at line {line_no}")
+        hex_value = value[start:end]
+        if not re.fullmatch(r"[0-9A-Fa-f]+", hex_value):
+            raise UnsupportedFrontmatterSyntaxError(f"Invalid Unicode escape at line {line_no}")
+        expected = "u" if digits == 4 else "U"
+        if escape_type != expected:
+            raise UnsupportedFrontmatterSyntaxError(f"Invalid Unicode escape at line {line_no}")
+        return int(hex_value, 16), end
 
     def _strip_comment(self, line: str) -> str:
         in_quote: str | None = None
@@ -259,6 +336,11 @@ class FrontmatterCodec:
     def _check_depth(self, indent: int) -> None:
         if indent // 2 > self.max_depth:
             raise UnsupportedFrontmatterSyntaxError("Frontmatter exceeds maximum nesting depth")
+
+    def _record_key(self, state: ParseState) -> None:
+        state.key_count += 1
+        if state.key_count > self.max_keys:
+            raise UnsupportedFrontmatterSyntaxError("Frontmatter exceeds maximum key count")
 
 
 def parse_frontmatter_safe(content: str) -> dict:

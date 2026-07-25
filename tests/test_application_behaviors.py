@@ -1,3 +1,4 @@
+import json
 import os
 import pytest
 from unittest.mock import MagicMock, patch
@@ -209,6 +210,42 @@ def test_generate_report_formatting(tmp_path):
     assert "# Relatório de Benchmark - CIDA Motor" in md
     assert "file1.md" in md
     assert "markdown" in md
+
+
+def test_generate_report_schema_1_remains_entry_list(tmp_path):
+    fs = PhysicalFilesystem()
+    jc = JsonCodec()
+    gen = ReportGeneratorUsecase(fs, jc)
+    file1 = tmp_path / "file1.md"
+    file1.write_text("hello")
+    gen.set_resources({"effective_workers": 4})
+    gen.add_entry(str(file1), "markdown", 10, 9, 8, False, 0, 0, [], [], "SUCCESS", 0.1)
+
+    gen.save_reports(str(tmp_path / "report.md"), str(tmp_path / "report.json"), str(tmp_path), "json")
+
+    payload = json.loads((tmp_path / "report.json").read_text())
+    assert isinstance(payload, list)
+    assert payload[0]["arquivo"] == "file1.md"
+
+
+def test_generate_report_schema_2_is_versioned_object(tmp_path):
+    fs = PhysicalFilesystem()
+    jc = JsonCodec()
+    gen = ReportGeneratorUsecase(fs, jc)
+    file1 = tmp_path / "file1.md"
+    file1.write_text("hello")
+    gen.set_report_schema(2)
+    gen.set_resources({"effective_workers": 4})
+    gen.set_failures([{"path": "bad.md", "stage": "read", "runtime": "python"}])
+    gen.add_entry(str(file1), "markdown", 10, 9, 8, False, 0, 0, [], [], "SUCCESS", 0.1)
+
+    gen.save_reports(str(tmp_path / "report.md"), str(tmp_path / "report.json"), str(tmp_path), "json")
+
+    payload = json.loads((tmp_path / "report.json").read_text())
+    assert payload["schema_version"] == 2
+    assert payload["resources"] == {"effective_workers": 4}
+    assert payload["entries"][0]["arquivo"] == "file1.md"
+    assert payload["failures"] == [{"path": "bad.md", "stage": "read", "runtime": "python"}]
 
 def test_generate_tree_manifest(tmp_path):
     fs = PhysicalFilesystem()

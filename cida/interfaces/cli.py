@@ -71,6 +71,19 @@ class FailureAggregator:
             file=sys.stderr,
         )
 
+    def as_report_failures(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "path": record.filepath,
+                "stage": record.operation,
+                "runtime": "python",
+                "category": record.error_type,
+                "exit_code": record.exit_code,
+                "message": record.message,
+            }
+            for record in self.records
+        ]
+
 
 class CidaArgumentParser(argparse.ArgumentParser):
     def error(self, message):
@@ -258,13 +271,16 @@ def main():
         parser.add_argument("--durable-writes", action="store_true", help="Perform durable fsync writes")
         parser.add_argument("--report", default="both", choices=["text", "json", "both"], help="Report format")
         parser.add_argument("--report-path", default="report", help="Report output path (without extension)")
+        parser.add_argument("--report-schema", type=int, default=1, choices=[1, 2], help="JSON report schema version")
         parser.add_argument("--verify-semantics", action=argparse.BooleanOptionalAction, default=True, help="Run semantic validations")
         parser.add_argument("--validation-level", choices=["balanced", "strict"], help="Validation security level: balanced (default) or strict")
         parser.add_argument("--strict-validation", action="store_true", help="Alias for --validation-level strict")
         parser.add_argument("--resource-profile", default="default", choices=["default", "light", "medium", "hard", "custom"], help="Resource profile accepted for Go/Python CLI parity")
         parser.add_argument("--workers", type=int, default=10, help="Maximum worker count accepted for Go/Python CLI parity")
+        parser.add_argument("--max-python-processes", type=int, default=None, help="Maximum Python subprocess/process parallelism")
         parser.add_argument("--logical-cpus", type=int, default=None, help=argparse.SUPPRESS)
         parser.add_argument("--gomaxprocs", type=int, default=None, help=argparse.SUPPRESS)
+        parser.add_argument("--effective-cpu-capacity", type=int, default=None, help=argparse.SUPPRESS)
         parser.add_argument("--requested-workers", type=int, default=None, help=argparse.SUPPRESS)
         parser.add_argument("--resource-resolution-source", default="python_cli", help=argparse.SUPPRESS)
         parser.add_argument("--dry-run", action="store_true", help="Dry run mode (no files written)")
@@ -273,6 +289,8 @@ def main():
         args = parser.parse_args()
         if args.workers < 1 or args.workers > 256:
             parser.error("--workers must be between 1 and 256")
+        if args.max_python_processes is not None and (args.max_python_processes < 1 or args.max_python_processes > args.workers):
+            parser.error("--max-python-processes must be between 1 and --workers")
 
         if args.strict_validation and args.validation_level not in (None, ValidationLevel.STRICT):
             parser.error("--strict-validation cannot be combined with --validation-level balanced")
@@ -311,14 +329,25 @@ def main():
                 print(f"Warning: failed to read Java raw metrics JSON: {je}")
 
         report_gen = ReportGeneratorUsecase(file_repo, json_codec)
+        report_gen.set_report_schema(args.report_schema)
         report_gen.set_resources({
             "logical_cpus": args.logical_cpus or os.cpu_count() or 1,
             "gomaxprocs": args.gomaxprocs,
+            "effective_cpu_capacity": args.effective_cpu_capacity or min(args.logical_cpus or os.cpu_count() or 1, args.gomaxprocs or args.logical_cpus or os.cpu_count() or 1),
             "profile": args.resource_profile,
             "requested_workers": args.requested_workers,
             "effective_workers": args.workers,
+            "max_python_processes": args.max_python_processes or min(args.workers, 4),
             "resolution_source": args.resource_resolution_source,
             "python_parallel_execution": False,
+            "parallel_stages": [],
+            "sequential_stages": [
+                "file_processing",
+                "corpus_dictionary",
+                "report_aggregation",
+                "strict_audit",
+                "transactional_promotion",
+            ],
         })
         file_opt = None
         if args.profile == "auto" or args.dictionary_scope == "file":
@@ -717,6 +746,7 @@ def main():
 
         report_name = args.report_path
         if not args.dry_run and args.report in ["text", "both", "json"]:
+            report_gen.set_failures(aggregator.as_report_failures())
             report_gen.save_reports(report_name + ".md", report_name + ".json", src_abs, args.report)
             print("\nBenchmark reports saved:")
             print(f"  Markdown: {report_name}.md")

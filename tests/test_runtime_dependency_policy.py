@@ -36,9 +36,21 @@ def test_relative_import_allowed():
     assert _violations("from .frontmatter_codec import FrontmatterCodec\n") == []
 
 
-def test_dynamic_import_suspicious():
+def test_dynamic_import_literals_block_forbidden_modules():
     violations = _violations("__import__('yaml')\n")
-    assert violations == [(1, "dynamic:__import__")]
+    assert violations == [(1, "yaml")]
+
+    violations = _violations("import importlib\nimportlib.import_module('yaml')\n")
+    assert violations == [(2, "yaml")]
+
+    violations = _violations("from importlib import import_module\nimport_module('yaml')\n")
+    assert violations == [(2, "yaml")]
+
+
+def test_dynamic_import_non_literals_are_not_dependency_violations():
+    assert _violations("__import__(name)\n") == []
+    assert _violations("import importlib\nimportlib.import_module(name)\n") == []
+    assert _violations("eval('1 + 1')\nexec('value = 1')\n") == []
 
 
 def test_runtime_gate_passes_repository():

@@ -27,7 +27,7 @@ They are listed through `requirements-dev.txt` and `requirements-ci.txt`, not `r
 
 ## Frontmatter Format
 
-CIDA supports a restricted frontmatter subset implemented with Python stdlib in `FrontmatterCodec`: key/value mappings, strings, quoted strings, booleans, null, numbers, inline lists, indented lists, and nested maps. It rejects duplicate keys, anchors, aliases, merge keys, custom tags, multiple documents, unsafe object construction, excessive depth, excessive key count, and ambiguous syntax.
+CIDA supports a restricted frontmatter subset implemented with Python stdlib in `FrontmatterCodec`: key/value mappings, strings, quoted strings, booleans, null, numbers, inline lists, indented lists, nested maps, nested lists, and multi-field maps inside lists. It rejects duplicate keys, anchors, aliases, merge keys, custom tags, multiple documents, block scalars, inline maps, unsafe object construction, excessive depth, excessive key count, and ambiguous syntax.
 
 ## Exception Process
 
