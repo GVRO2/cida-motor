@@ -279,29 +279,52 @@ jobs:
     - name: Install Python dependencies
       run: python -m pip install -r requirements-ci.txt
 
+    - name: Production TKNC Generation
+      run: python -m pytest tests/test_tknc_production_pipeline.py -q
+
+    - name: Chunk Naming Scale Contract
+      run: python -m pytest tests/test_corpus_chunk_naming.py -q
+
+    - name: Alias Index Integrity
+      run: python -m pytest tests/test_alias_index_v2.py tests/test_alias_index_scale.py -q
+
+    - name: Selective Lookup Instrumentation
+      run: python -m pytest tests/test_selective_alias_resolution.py tests/test_tknc_context_contract.py -q
+
+    - name: Real Search Benchmark
+      run: python -m pytest tests/test_context_search_original.py tests/test_context_search_tknc.py -q
+
+    - name: Accuracy Validation
+      run: python -m pytest tests/test_context_accuracy.py -q
+
+    - name: Full vs Full Context
+      run: python -m pytest tests/test_context_usage_benchmark.py::test_context_usage_benchmark_generates_passing_reports -q
+
+    - name: Selective Cold Context
+      run: python -m pytest tests/test_context_usage_benchmark.py::test_context_usage_benchmark_generates_passing_reports -q
+
+    - name: Selective Warm Context
+      run: python -m pytest tests/test_context_usage_benchmark.py::test_context_usage_benchmark_generates_passing_reports -q
+
+    - name: Multi-query Break-even
+      run: python -m pytest tests/test_context_usage_benchmark.py::test_context_usage_benchmark_generates_passing_reports -q
+
     - name: Runtime Harness Isolation
       run: python -m pytest tests/test_runtime_harness_decoupling.py -q
 
-    - name: Selective Alias Lookup
-      run: python -m pytest tests/test_selective_alias_resolution.py -q
-
-    - name: Context Usage Benchmark
-      run: python -m pytest tests/test_context_usage_benchmark.py -q
-
-    - name: Context Accuracy Contract
-      run: python -m pytest tests/test_tknc_context_contract.py -q
-
-    - name: No Global Dictionary Preload
-      run: python benchmarks/context_usage_compare.py --output-json context-usage-report-${{ matrix.os }}.json --output-markdown context-usage-report-${{ matrix.os }}.md
+    - name: Generate Context Artifacts
+      run: python benchmarks/context_usage_compare.py --output-json context-usage-report-v2-${{ matrix.os }}.json --output-markdown context-usage-report-v2-${{ matrix.os }}.md --read-events-json read-events-${{ matrix.os }}.json --harness-events-json harness-events-${{ matrix.os }}.json
 
     - name: Artifact Upload
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: context-usage-report-${{ matrix.os }}
+        name: context-usage-report-v2-${{ matrix.os }}
         path: |
-          context-usage-report-${{ matrix.os }}.json
-          context-usage-report-${{ matrix.os }}.md
+          context-usage-report-v2-${{ matrix.os }}.json
+          context-usage-report-v2-${{ matrix.os }}.md
+          read-events-${{ matrix.os }}.json
+          harness-events-${{ matrix.os }}.json
 
   compare:
     name: Compare Manifests

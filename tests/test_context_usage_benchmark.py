@@ -32,12 +32,12 @@ def test_context_usage_benchmark_generates_passing_reports(tmp_path):
     assert result.returncode == 0, result.stderr + result.stdout
     report = json.loads(output_json.read_text(encoding="utf-8"))
 
-    assert report["schema_version"] == 1
+    assert report["schema_version"] == 2
     assert report["summary"]["overall_result"] == "PASS"
-    assert report["summary"]["tknc_total_context_tokens"] < report["summary"]["original_total_context_tokens"]
-    assert report["summary"]["tknc_accuracy"] >= report["summary"]["original_accuracy"]
-    assert len(report["scenarios"]) == 15
-    assert output_md.read_text(encoding="utf-8").startswith("# CIDA .tknc Context Usage Report")
+    assert report["summary"]["full_vs_full"]["result"] == "PASS"
+    assert report["summary"]["accuracy"]["tknc_score"] >= report["summary"]["accuracy"]["original_score"]
+    assert len(report["scenarios"]) == 20
+    assert output_md.read_text(encoding="utf-8").startswith("# CIDA .tknc Context Usage Report v2")
 
 
 def test_context_usage_benchmark_records_no_global_preload(tmp_path):

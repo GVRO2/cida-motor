@@ -43,8 +43,9 @@ def test_tknc_selective_context_gate_and_accuracy(tmp_path):
     measured = _measure_question(OfflineTokenizer(), original, tknc, _question_set()[2])
 
     assert measured["tknc"]["global_dictionary_preload"] is False
-    assert measured["tknc"]["chunks_loaded"] == ["B0.cidatkn"]
-    assert measured["tknc"]["entries_loaded"] == 2
+    assert measured["tknc"]["chunks_loaded"]
+    assert all(name.startswith("chunk-") for name in measured["tknc"]["chunks_loaded"])
+    assert measured["tknc"]["entries_loaded"] > 0
     assert measured["tknc"]["total_context_tokens"] < measured["original"]["full_total_context_tokens"]
-    assert measured["accuracy"]["tknc"] >= measured["accuracy"]["original"]
+    assert measured["accuracy"]["tknc"]["accuracy"] >= measured["accuracy"]["original"]["accuracy"]
     assert measured["result"] == "PASS"

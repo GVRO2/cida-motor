@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
-from cida.application.selective_alias_resolution import build_alias_index, SelectiveAliasResolver
+from cida.application.selective_alias_resolution import build_alias_index, SelectiveAliasResolver, corpus_chunk_filename
 from cida.infrastructure.filesystem import PhysicalFilesystem
 from cida.infrastructure.hashing import HashService
 from cida.infrastructure.json_codec import JsonCodec
@@ -100,7 +100,8 @@ def test_python_runtime_has_zero_harness_activity_under_probe(tmp_path):
         "--report-path", str(dst_dir / "report"),
     ]
 
-    with patch.object(sys, "argv", args), RuntimeHarnessProbe() as probe:
+    env = {"TIKTOKEN_CACHE_DIR": str(REPO_ROOT / "resources")}
+    with patch.object(sys, "argv", args), patch.dict(os.environ, env), RuntimeHarnessProbe() as probe:
         main()
 
     assert probe.counters == {
@@ -120,21 +121,31 @@ def test_tknc_alias_lookup_has_zero_harness_activity_under_probe(tmp_path):
     fs = PhysicalFilesystem()
     hs = HashService()
     jc = JsonCodec()
+    dictionary_id = hs.sha256(b"dictionary")
+    manifest_sha256 = hs.sha256(b"manifest")
+    chunk_name = corpus_chunk_filename(0)
+    entries = {"AA": "replacement"}
     sidecar_data = {
         "format": "cida-token-sidecar",
-        "version": 1,
+        "version": 2,
         "source": "corpus",
-        "source_sha256": "a" * 64,
-        "entries": {"AA": "replacement"},
+        "dictionary_id": dictionary_id,
+        "manifest_sha256": manifest_sha256,
+        "chunk_index": 0,
+        "chunk_count": 1,
+        "entries_sha256": hs.sha256(jc.canonical_encode(entries).encode("utf-8")),
+        "entries": entries,
     }
     serialized = jc.encode(sidecar_data, indent=4)
-    (tknd / "A0.cidatkn").write_text(serialized, encoding="utf-8", newline="\n")
+    (tknd / chunk_name).write_text(serialized, encoding="utf-8", newline="\n")
     index_data = build_alias_index(
-        {"AA": "A0.cidatkn"},
-        "dict-1",
-        {"A0.cidatkn": hs.sha256(serialized.encode("utf-8"))},
+        {"AA": chunk_name},
+        dictionary_id,
+        {chunk_name: hs.sha256(serialized.encode("utf-8"))},
         hs,
         jc,
+        manifest_sha256=manifest_sha256,
+        chunk_entry_counts={chunk_name: 1},
     )
     (tknd / "alias-index.json").write_text(jc.encode(index_data, indent=4), encoding="utf-8", newline="\n")
 
@@ -143,5 +154,5 @@ def test_tknc_alias_lookup_has_zero_harness_activity_under_probe(tmp_path):
         result = resolver.resolve({"AA"}, str(tknd))
 
     assert result.resolved == {"AA": "replacement"}
-    assert result.chunks_loaded == ("A0.cidatkn",)
+    assert result.chunks_loaded == (chunk_name,)
     assert all(value == 0 for value in probe.counters.values())
