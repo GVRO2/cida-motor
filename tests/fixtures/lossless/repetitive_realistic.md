@@ -28,6 +28,20 @@ Robust decompressor_implementation performance is essential for reliable reconst
 The validation_checker strategy requires running validation_checker checks on both sidecar schemas and reconstructed content.
 When optimization_pipeline is executed, token counts are evaluated before and after optimization_pipeline.
 If optimization_pipeline yields no net gain after accounting for sidecar overhead, optimization_pipeline is skipped.
+
+## System Components and Specifications
+
+The architecture_specification design mandates strict isolation between layers.
+Every decompressor_implementation must adhere to the reconstruction_processor rules.
+The infrastructure_implementation handles low-level I/O while interfaces_implementation manages CLI commands.
+With validation_checker enforcing schema rules, optimization_pipeline operates safely.
+Repeated architecture_specification, decompressor_implementation, reconstruction_processor, infrastructure_implementation, and validation_checker guidelines.
+Repeated architecture_specification, decompressor_implementation, reconstruction_processor, infrastructure_implementation, and validation_checker guidelines.
+Repeated architecture_specification, decompressor_implementation, reconstruction_processor, infrastructure_implementation, and validation_checker guidelines.
+Repeated architecture_specification, decompressor_implementation, reconstruction_processor, infrastructure_implementation, and validation_checker guidelines.
+Repeated architecture_specification, decompressor_implementation, reconstruction_processor, infrastructure_implementation, and validation_checker guidelines.
+Repeated architecture_specification, decompressor_implementation, reconstruction_processor, infrastructure_implementation, and validation_checker guidelines.
+
 Therefore, optimization_pipeline and validation_checker work in tandem to deliver token efficiency across the architecture_specification.
 Comprehensive validation_checker guarantees that optimization_pipeline does not break semantic or byte-level contracts.
 During optimization_pipeline, the optimizer selects candidate words and evaluates potential token savings.

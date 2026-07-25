@@ -1,4 +1,4 @@
-from typing import Protocol, List, Any
+from typing import Protocol, List, Any, Optional
 
 class HashService(Protocol):
     def sha256(self, content: bytes) -> str:
@@ -8,7 +8,7 @@ class HashService(Protocol):
         ...
 
 class TokenCounter(Protocol):
-    def count(self, text: str) -> int:
+    def count(self, text: str, content_hash: Optional[str] = None) -> int:
         ...
 
 class JsonCodec(Protocol):

@@ -1,10 +1,16 @@
 import re
 from collections import Counter
+from typing import Any, Callable
 from cida.application.ports import TokenCounter, FileRepository, HashService, JsonCodec
 from cida.markdown.protected_regions import ProtectedRegionsManager
 from cida.markdown.dictionary import generate_alias_candidates, find_candidate_words, apply_dictionary
 from cida.domain.sidecar import create_sidecar_data
-from cida.markdown.semantic_equivalence import validate_semantics
+
+
+def _load_semantic_dependencies() -> tuple[type[Any], Callable[..., tuple[bool, str]]]:
+    from cida.markdown.semantic_equivalence import ParsedOriginalDocument, validate_semantics
+    return ParsedOriginalDocument, validate_semantics
+
 
 class FileOptimizerUsecase:
     """Orchestrates token minification and dictionary replacement for a single file."""
@@ -45,7 +51,10 @@ class FileOptimizerUsecase:
 
         return 'markdown'
 
-    def optimize_markdown_dictionary_file_scope(self, content: str, transformed_text: str, filepath: str, verify_semantics: bool) -> tuple:
+    def optimize_markdown_dictionary_file_scope(self, content: str, transformed_text: str, filepath: str, verify_semantics: bool, precomputed_source_sha256: str = "") -> tuple:
+        content_bytes = content.encode('utf-8')
+        source_sha256 = precomputed_source_sha256 if precomputed_source_sha256 else self.hash_service.sha256(content_bytes)
+
         base_tokens = self.token_counter.count(transformed_text)
         best_tokens = base_tokens
         best_minified = transformed_text
@@ -84,6 +93,12 @@ class FileOptimizerUsecase:
         if not current_dict:
             return transformed_text, None, 0
 
+        parsed_orig = None
+        ParsedOriginalDocument: type[Any] | None = None
+        validate_semantics: Callable[..., tuple[bool, str]] | None = None
+        if verify_semantics:
+            ParsedOriginalDocument, validate_semantics = _load_semantic_dependencies()
+
         words_to_eval = list(current_dict.items())
         working_dict = {}
 
@@ -93,28 +108,45 @@ class FileOptimizerUsecase:
             entries_dict = {a: w for w, a in working_dict.items()}
 
             try:
-                sidecar_data = create_sidecar_data(filepath, content.encode('utf-8'), entries_dict, self.hash_service)
+                sidecar_data = create_sidecar_data(filepath, content_bytes, entries_dict, self.hash_service, precomputed_sha256=source_sha256)
             except Exception:
                 working_dict.pop(word)
                 continue
 
+            sidecar_ref = self.file_repo.basename(filepath) + ".cidatkn"
+            envelope_header = (
+                f"<!-- CIDA_COMPRESSED_FORMAT\n"
+                f"version: 1\n"
+                f"mode: lossless\n"
+                f"sidecar_required: true\n"
+                f"sidecar_ref: {sidecar_ref}\n"
+                f"source_sha256: {sidecar_data['source_sha256']}\n"
+                f"compression_strategy: dictionary\n"
+                f"-->\n"
+            )
+
+            tokens_min = self.token_counter.count(candidate_minified)
+            tokens_envelope = self.token_counter.count(envelope_header)
+            tokens_sidecar = self.token_counter.count(self.json_codec.encode(sidecar_data, indent=4))
+
+            effective_tokens = tokens_min + tokens_envelope + tokens_sidecar
+
+            if effective_tokens >= best_tokens:
+                continue
+
             if verify_semantics:
-                is_valid, _ = validate_semantics(content, candidate_minified, working_dict)
+                assert ParsedOriginalDocument is not None
+                assert validate_semantics is not None
+                if parsed_orig is None:
+                    parsed_orig = ParsedOriginalDocument(content)
+                is_valid, _ = validate_semantics(content, candidate_minified, working_dict, parsed_original=parsed_orig)
                 if not is_valid:
                     working_dict.pop(word)
                     continue
 
-            tokens_min = self.token_counter.count(candidate_minified)
-            tokens_sidecar = self.token_counter.count(self.json_codec.encode(sidecar_data, indent=4))
-            tokens_instr = self.token_counter.count("Use the companion sidecar file to resolve aliases.")
+            best_tokens = effective_tokens
+            best_minified = candidate_minified
+            best_sidecar_data = sidecar_data
 
-            effective_tokens = tokens_min + tokens_sidecar + tokens_instr
-
-            if effective_tokens < best_tokens:
-                best_tokens = effective_tokens
-                best_minified = candidate_minified
-                best_sidecar_data = sidecar_data
-
-        final_tokens_dict = self.token_counter.count(self.json_codec.encode(best_sidecar_data, indent=4)) if best_sidecar_data else 0
-        return best_minified, best_sidecar_data, final_tokens_dict
-
+        final_sidecar_tokens = self.token_counter.count(self.json_codec.encode(best_sidecar_data, indent=4)) if best_sidecar_data else 0
+        return best_minified, best_sidecar_data, final_sidecar_tokens

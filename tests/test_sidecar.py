@@ -171,5 +171,90 @@ class TestSidecarDictionaries(unittest.TestCase):
     def test_roundtrip_no_gain(self):
         self.run_roundtrip_test("small content", expected_sidecar=False)
 
+
+class TestSidecarValidatorUsecase(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        from cida.infrastructure.filesystem import PhysicalFilesystem
+        from cida.infrastructure.hashing import HashService
+        from cida.infrastructure.json_codec import JsonCodec
+        from cida.application.validate_sidecar import SidecarValidatorUsecase
+
+        self.repo = PhysicalFilesystem()
+        self.hs = HashService()
+        self.codec = JsonCodec()
+        self.validator = SidecarValidatorUsecase(self.repo, self.codec, self.hs)
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir)
+
+    def test_validate_output_bundle_nonexistent_output(self):
+        with self.assertRaises(SidecarValidationError):
+            self.validator.validate_output_bundle(self.temp_dir, self.temp_dir, os.path.join(self.temp_dir, "missing.md"))
+
+    def test_validate_output_bundle_outside_root(self):
+        src = os.path.join(self.temp_dir, "src")
+        out = os.path.join(self.temp_dir, "out")
+        os.makedirs(src)
+        os.makedirs(out)
+        outside_file = os.path.join(self.temp_dir, "outside.md")
+        self.repo.write_text(outside_file, "content")
+
+        with self.assertRaises(SidecarValidationError):
+            self.validator.validate_output_bundle(src, out, outside_file)
+
+    def test_validate_output_bundle_orphan_and_source_checks(self):
+        src = os.path.join(self.temp_dir, "src")
+        out = os.path.join(self.temp_dir, "out")
+        os.makedirs(src)
+        os.makedirs(out)
+
+        orig = os.path.join(src, "doc.md")
+        self.repo.write_text(orig, "hello world content")
+        orig_sha = self.hs.sha256(b"hello world content")
+
+        out_file = os.path.join(out, "doc.md")
+        sidecar_file = os.path.join(out, "doc.md.cidatkn")
+
+        env_header = f"<!-- CIDA_COMPRESSED_FORMAT\nversion: 1\nmode: lossless\nsidecar_required: true\nsidecar_ref: doc.md.cidatkn\nsource_sha256: {orig_sha}\ncompression_strategy: dictionary\n-->\nPayload"
+        self.repo.write_text(out_file, env_header)
+
+        sidecar_data = {
+            "format": "cida-token-sidecar",
+            "version": 1,
+            "source": "doc.md",
+            "source_sha256": orig_sha,
+            "entries": {"P": "Payload"}
+        }
+        self.repo.write_text(sidecar_file, self.codec.encode(sidecar_data))
+
+        # Successful validation
+        self.validator.validate_output_bundle(src, out, out_file, sidecar_file)
+
+        # Missing source file
+        os.remove(orig)
+        with self.assertRaises(SidecarValidationError):
+            self.validator.validate_output_bundle(src, out, out_file, sidecar_file)
+
+    def test_verify_destination_sidecars(self):
+        src = os.path.join(self.temp_dir, "src")
+        out = os.path.join(self.temp_dir, "out")
+        os.makedirs(src)
+        os.makedirs(out)
+
+        sidecar_file = os.path.join(out, "orphan.cidatkn")
+        sidecar_data = {
+            "format": "cida-token-sidecar",
+            "version": 1,
+            "source": "nonexistent.md",
+            "source_sha256": "a" * 64,
+            "entries": {"A": "B"}
+        }
+        self.repo.write_text(sidecar_file, self.codec.encode(sidecar_data))
+
+        with self.assertRaises(SidecarValidationError):
+            self.validator.verify_destination_sidecars(src, out)
+
+
 if __name__ == "__main__":
     unittest.main()

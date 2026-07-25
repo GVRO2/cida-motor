@@ -25,13 +25,9 @@ from cida.domain.errors import SidecarValidationError  # noqa: E402
 
 class TestPipelineIntegration(unittest.TestCase):
     def setUp(self):
-        self.test_dir = os.path.abspath("tests/fixtures/integration_sandbox")
+        self.test_dir = tempfile.mkdtemp(prefix="cida-integration-")
         self.src_dir = os.path.join(self.test_dir, "src")
         self.dst_dir = os.path.join(self.test_dir, "dst")
-
-        # Clean up
-        if os.path.exists(self.test_dir):
-            shutil.rmtree(self.test_dir)
 
         os.makedirs(self.src_dir, exist_ok=True)
         os.makedirs(self.dst_dir, exist_ok=True)
@@ -65,6 +61,7 @@ class TestPipelineIntegration(unittest.TestCase):
             "go", "run", "motor_v3.go",
             self.src_dir,
             self.dst_dir,
+            "--mode", "semantic",
             "--profile", "auto",
             "--dictionary-scope", "file",
             "--report", "both"
@@ -73,6 +70,9 @@ class TestPipelineIntegration(unittest.TestCase):
         # Setup Tiktoken cache dir env variable
         env = os.environ.copy()
         env["TIKTOKEN_CACHE_DIR"] = os.path.abspath("resources")
+        go_cache = os.path.abspath(os.path.join(".cida-local", "go-build-cache"))
+        os.makedirs(go_cache, exist_ok=True)
+        env["GOCACHE"] = go_cache
 
         result = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
         self.assertEqual(result.returncode, 0, f"Execution failed:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
@@ -256,6 +256,7 @@ class TestPythonUsecases(unittest.TestCase):
             "token_optimizer.py",
             "--src", self.src_dir,
             "--dst", self.dst_dir,
+            "--mode", "semantic",
             "--profile", "auto",
             "--dictionary-scope", "corpus",
             "--report", "both",

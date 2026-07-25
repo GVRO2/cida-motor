@@ -104,7 +104,7 @@ class TestCLIExitCodes(unittest.TestCase):
                 f.write("public class App { public static void main(String[] args) {} }")
 
             # Running tokenizer-based count should now fail and exit with code 2
-            res = self.run_cli([src, os.path.join(self.temp_dir, "dst")], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            res = self.run_cli([src, os.path.join(self.temp_dir, "dst"), "--mode", "semantic"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             self.assertEqual(res.returncode, 2)
         finally:
             if os.path.exists(counter_bak):
@@ -124,7 +124,7 @@ class TestCLIExitCodes(unittest.TestCase):
             with open(os.path.join(src, "App.java"), "w", encoding="utf-8") as f:
                 f.write("public class App { public static void main(String[] args) {} }")
 
-            res = self.run_cli([src, os.path.join(self.temp_dir, "dst")], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            res = self.run_cli([src, os.path.join(self.temp_dir, "dst"), "--mode", "semantic"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             self.assertEqual(res.returncode, 2)
         finally:
             with open(counter_path, "wb") as f:
@@ -159,8 +159,9 @@ class TestCLIExitCodes(unittest.TestCase):
         with open(os.path.join(dst, "tknd/A0.cidatkn"), "w", encoding="utf-8") as f:
             f.write("{invalid json")
 
-        res = self.run_cli([src, dst, "--profile", "markdown"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        res = self.run_cli([src, dst, "--profile", "markdown", "--validation-level", "strict"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(res.returncode, 5)
+
 
     def test_exit_code_6_internal_error(self):
         # Clear PATH to prevent Go CLI from starting Python

@@ -1,4 +1,5 @@
 import re
+from enum import Enum
 
 def classify_comment(comment_text: str) -> str:
     """
@@ -47,3 +48,57 @@ def is_binary_extension(filepath: str) -> bool:
     ext = parts[-1].lower()
     binary_extensions = {'png', 'jpg', 'jpeg', 'gif', 'zip', 'pdf', 'exe', 'dll', 'class', 'jar', 'db', 'pyc'}
     return ext in binary_extensions
+
+
+def validate_mode_profile_combination(mode: str, profile: str, dictionary_scope: str, detected_profile: str = "") -> None:
+    """
+    Validates mode, profile, and dictionary_scope combinations.
+    In lossless mode, code, java, and corpus dictionary scope are explicitly rejected.
+    """
+    from cida.domain.errors import UsageError
+
+    eff_profile = detected_profile if (profile == "auto" and detected_profile) else profile
+
+    if mode == "lossless":
+        if eff_profile in ("code", "java"):
+            raise UsageError(
+                "Lossless mode currently supports only Markdown and BMAD profiles. "
+                "Use --mode semantic for code or Java inputs."
+            )
+        if dictionary_scope == "corpus":
+            raise UsageError(
+                "Corpus dictionary is not currently supported in lossless mode. "
+                "Use --dictionary-scope file or --mode semantic."
+            )
+
+
+class ValidationLevel(str, Enum):
+    BALANCED = "balanced"
+    STRICT = "strict"
+
+    @classmethod
+    def all(cls) -> list[str]:
+        return [level.value for level in cls]
+
+
+def validate_validation_level(level: str | ValidationLevel) -> ValidationLevel:
+    """Validates and normalizes the validation level string.
+
+    Raises UsageError if invalid.
+    """
+    from cida.domain.errors import UsageError
+
+    if isinstance(level, ValidationLevel):
+        return level
+
+    if not isinstance(level, str):
+        raise UsageError(
+            f"Invalid validation level '{level}'. Allowed values are: {', '.join(ValidationLevel.all())}"
+        )
+
+    normalized_level = level.lower()
+    if normalized_level not in ValidationLevel.all():
+        raise UsageError(
+            f"Invalid validation level '{level}'. Allowed values are: {', '.join(ValidationLevel.all())}"
+        )
+    return ValidationLevel(normalized_level)

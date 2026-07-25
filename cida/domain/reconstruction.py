@@ -15,8 +15,10 @@ def reconstruct_content(compressed_text: str, sidecar_data: dict) -> str:
 
     entries = sidecar_data.get("entries", {})
 
-    # Strip header line if present
-    text = compressed_text
+    from cida.domain.sidecar import parse_compressed_envelope
+
+    # Strip envelope header or legacy header if present
+    _, text = parse_compressed_envelope(compressed_text)
     header_pattern = re.compile(r'^>\s*🤖\s*AI RAG DICT:.*?\n\n', re.DOTALL)
     text = header_pattern.sub('', text)
 

@@ -89,3 +89,37 @@ func TestIsBinaryFileGo(t *testing.T) {
 		})
 	}
 }
+
+func TestResolveValidationLevel(t *testing.T) {
+	tests := []struct {
+		name                    string
+		validationLevel         string
+		strictValidation        bool
+		validationLevelExplicit bool
+		expected                string
+		expectErr               bool
+	}{
+		{"default balanced", "balanced", false, false, "balanced", false},
+		{"explicit balanced", "balanced", false, true, "balanced", false},
+		{"explicit strict", "strict", false, true, "strict", false},
+		{"strict alias", "balanced", true, false, "strict", false},
+		{"strict alias with explicit strict", "strict", true, true, "strict", false},
+		{"strict alias conflicts with balanced", "balanced", true, true, "", true},
+		{"invalid level", "unknown", false, true, "", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := resolveValidationLevel(tt.validationLevel, tt.strictValidation, tt.validationLevelExplicit)
+			if tt.expectErr && err == nil {
+				t.Fatal("expected error")
+			}
+			if !tt.expectErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if result != tt.expected {
+				t.Errorf("resolveValidationLevel() = %s; want %s", result, tt.expected)
+			}
+		})
+	}
+}

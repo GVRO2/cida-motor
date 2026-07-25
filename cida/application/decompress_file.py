@@ -2,7 +2,7 @@ import re
 from typing import Optional
 from cida.domain.errors import SidecarValidationError, ReconstructionError, SourcePathError
 from cida.domain.reconstruction import reconstruct_content
-from cida.domain.sidecar import validate_sidecar_schema
+from cida.domain.sidecar import validate_sidecar_schema, parse_compressed_envelope
 
 class FileDecompressorUsecase:
     def __init__(self, file_repo, json_codec, hash_service=None):
@@ -11,6 +11,8 @@ class FileDecompressorUsecase:
         self.hash_service = hash_service
 
     def _has_compression_marker(self, text: str) -> bool:
+        if text.startswith("<!-- CIDA_COMPRESSED_FORMAT"):
+            return True
         if re.search(r'>\s*🤖\s*AI RAG DICT:|AI RAG DICT:', text):
             return True
         return False
@@ -26,7 +28,29 @@ class FileDecompressorUsecase:
             from cida.domain.errors import EncodingValidationError
             raise EncodingValidationError(f"Invalid UTF-8 encoding in compressed file: {e}") from e
 
+        envelope_meta, payload = parse_compressed_envelope(compressed_text)
         has_marker = self._has_compression_marker(compressed_text)
+
+        if envelope_meta:
+            if envelope_meta.get("version") != 1:
+                raise SidecarValidationError(f"Unsupported format version: {envelope_meta.get('version')}")
+
+            if sidecar_filepath is None and "sidecar_ref" in envelope_meta:
+                ref = envelope_meta["sidecar_ref"]
+                parent_dir = self.file_repo.dirname(compressed_filepath)
+                from cida.domain.sidecar import validate_sidecar_ref
+                validate_sidecar_ref(ref)
+
+                candidates = [
+                    self.file_repo.join(parent_dir, ref),
+                    self.file_repo.join(parent_dir, "sidecar", ref),
+                    self.file_repo.join(parent_dir, "tknd", ref),
+                    compressed_filepath + ".cidatkn"
+                ]
+                for cand in candidates:
+                    if self.file_repo.exists(cand):
+                        sidecar_filepath = cand
+                        break
 
         if sidecar_filepath is None:
             sidecar_filepath = compressed_filepath + ".cidatkn"
@@ -34,6 +58,8 @@ class FileDecompressorUsecase:
         sidecar_exists = self.file_repo.exists(sidecar_filepath)
 
         if not sidecar_exists:
+            if envelope_meta and envelope_meta.get("sidecar_required"):
+                raise SidecarValidationError(f"Missing required sidecar file '{sidecar_filepath}' for compressed file '{compressed_filepath}'")
             if has_marker:
                 raise SidecarValidationError(f"Missing required sidecar file '{sidecar_filepath}' for compressed file '{compressed_filepath}'")
             return raw_bytes
@@ -47,6 +73,10 @@ class FileDecompressorUsecase:
             raise SidecarValidationError(f"Failed to read/decode sidecar file '{sidecar_filepath}': {e}") from e
 
         validate_sidecar_schema(sidecar_data)
+
+        if envelope_meta:
+            from cida.domain.sidecar import reconcile_envelope_and_sidecar
+            reconcile_envelope_and_sidecar(envelope_meta, sidecar_data, sidecar_filepath)
 
         sidecar_source = sidecar_data.get("source")
         if not sidecar_source or not isinstance(sidecar_source, str):
@@ -67,11 +97,11 @@ class FileDecompressorUsecase:
                     f"Sidecar source mismatch: sidecar specifies '{sidecar_source}', but compressed file is '{compressed_filepath}'"
                 )
 
-        reconstructed_text = reconstruct_content(compressed_text, sidecar_data)
+        reconstructed_text = reconstruct_content(payload, sidecar_data)
         reconstructed_bytes = reconstructed_text.encode('utf-8')
 
-        if "source_sha256" in sidecar_data and self.hash_service:
-            expected_sha = sidecar_data["source_sha256"]
+        expected_sha = sidecar_data.get("source_sha256") or (envelope_meta.get("source_sha256") if envelope_meta else None)
+        if expected_sha and self.hash_service:
             actual_sha = self.hash_service.sha256(reconstructed_bytes)
             if expected_sha.lower() != actual_sha.lower():
                 raise ReconstructionError(f"Reconstructed SHA256 mismatch: expected '{expected_sha}', got '{actual_sha}'")
@@ -82,3 +112,4 @@ class FileDecompressorUsecase:
         reconstructed_bytes = self.decompress(compressed_filepath, sidecar_filepath)
         self.file_repo.write_bytes(output_filepath, reconstructed_bytes)
         return reconstructed_bytes
+

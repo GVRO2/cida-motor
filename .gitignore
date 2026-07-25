@@ -6,6 +6,7 @@ __pycache__/
 .vscode/
 *.exe
 /motor_v3
+.cida-local/
 .pytest_cache/
 tests/fixtures/bmad_project_mimificado/
 report.json
@@ -13,6 +14,7 @@ report.md
 report_local.json
 report_local.md
 manifest-*.json
+performance-*.json
 .coverage
 coverage.json
 htmlcov/

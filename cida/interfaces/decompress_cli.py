@@ -7,9 +7,14 @@ from cida.infrastructure.hashing import HashService
 from cida.infrastructure.json_codec import JsonCodec
 from cida.application.decompress_file import FileDecompressorUsecase
 
+class CidaArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        sys.stderr.write(f"error: {message}\n")
+        sys.exit(1)
+
 def main():
     try:
-        parser = argparse.ArgumentParser(description="Production Decompressor for CIDA Sidecars")
+        parser = CidaArgumentParser(description="Production Decompressor for CIDA Sidecars")
         parser.add_argument("--src", required=True, help="Path to compressed file")
         parser.add_argument("--dst", required=True, help="Path to output decompressed file")
         parser.add_argument("--sidecar", help="Path to sidecar file (.cidatkn)")

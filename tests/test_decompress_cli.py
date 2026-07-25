@@ -175,3 +175,32 @@ def test_decompress_file_usecase_edge_cases(tmp_path):
     }
     bad_json_sidecar.write_bytes(jc.encode(sidecar_corpus).encode("utf-8"))
     assert usecase.decompress(str(comp_marked)) == b"word content"
+
+    # 11. Envelope version != 1 -> SidecarValidationError
+    bad_ver_env = tmp_path / "badver.md"
+    bad_ver_env.write_text("<!-- CIDA_COMPRESSED_FORMAT\nversion: 2\nmode: lossless\nsidecar_required: true\nsidecar_ref: s.cidatkn\nsource_sha256: " + "a"*64 + "\ncompression_strategy: dictionary\n-->\nPayload")
+    with pytest.raises(SidecarValidationError, match="Unsupported format version"):
+        usecase.decompress(str(bad_ver_env))
+
+    # 12. Candidate resolution in sidecar/ and tknd/ subdirectories
+    sub_dir = tmp_path / "sub"
+    sub_dir.mkdir()
+    tknd_dir = sub_dir / "tknd"
+    tknd_dir.mkdir()
+
+    env_file = sub_dir / "doc.md"
+    sha_val = hs.sha256(b"replacement text")
+    env_content = f"<!-- CIDA_COMPRESSED_FORMAT\nversion: 1\nmode: lossless\nsidecar_required: true\nsidecar_ref: ref.cidatkn\nsource_sha256: {sha_val}\ncompression_strategy: dictionary\n-->\nAA text"
+    env_file.write_text(env_content)
+
+    sidecar_in_tknd = tknd_dir / "ref.cidatkn"
+    sidecar_in_tknd.write_bytes(jc.encode({
+        "format": "cida-token-sidecar",
+        "version": 1,
+        "source": "doc.md",
+        "source_sha256": sha_val,
+        "entries": {"AA": "replacement"}
+    }).encode("utf-8"))
+
+    decomp_bytes = usecase.decompress(str(env_file))
+    assert decomp_bytes == b"replacement text"
