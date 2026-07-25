@@ -10,9 +10,19 @@ class ReportGeneratorUsecase:
         self.json_codec = json_codec
         self.entries: list = []
         self.resources: dict | None = None
+        self.failures: list = []
+        self.report_schema = 1
 
     def set_resources(self, resources: dict) -> None:
         self.resources = resources
+
+    def set_failures(self, failures: list) -> None:
+        self.failures = failures
+
+    def set_report_schema(self, schema: int) -> None:
+        if schema not in (1, 2):
+            raise ValueError(f"Unsupported report schema: {schema}")
+        self.report_schema = schema
 
     def add_entry(self, filepath: str, profile: str, tokens_orig: int, tokens_base: int, tokens_new: int,
                   dict_included: bool, tokens_sidecar: int, tokens_aux: int, accepted_transforms: list,
@@ -94,10 +104,12 @@ class ReportGeneratorUsecase:
         if report_format in ["json", "both"]:
             self.file_repo.makedirs(self.file_repo.dirname(json_path))
             payload: Any = self.entries
-            if self.resources is not None:
+            if self.report_schema == 2:
                 payload = {
+                    "schema_version": 2,
                     "resources": self.resources,
                     "entries": self.entries,
+                    "failures": self.failures,
                 }
             serialized_json = self.json_codec.encode(payload, indent=4)
             self.file_repo.write_text(json_path, serialized_json)

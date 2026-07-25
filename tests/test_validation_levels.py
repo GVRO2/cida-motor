@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import subprocess
@@ -117,6 +118,37 @@ def test_balanced_does_not_construct_strict_auditor(tmp_path, monkeypatch):
         cli_main()
 
     load_auditor.assert_not_called()
+
+
+def test_python_context_parallelism_reported_for_independent_files(tmp_path, monkeypatch):
+    src_dir = tmp_path / "src"
+    dst_dir = tmp_path / "dst"
+    src_dir.mkdir()
+    (src_dir / "a.md").write_text("# A\n\nSmall content.\n", encoding="utf-8")
+    (src_dir / "b.md").write_text("# B\n\nSmall content.\n", encoding="utf-8")
+    report_path = tmp_path / "report"
+
+    monkeypatch.setenv("TIKTOKEN_CACHE_DIR", str(REPO_ROOT / "resources"))
+
+    with patch.object(sys, "argv", [
+        "cida",
+        "--src", str(src_dir),
+        "--dst", str(dst_dir),
+        "--workers", "2",
+        "--resource-profile", "custom",
+        "--report", "json",
+        "--report-path", str(report_path),
+        "--report-schema", "2",
+    ]):
+        cli_main()
+
+    report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    assert report["schema_version"] == 2
+    assert report["resources"]["python_parallel_execution"] is True
+    assert report["resources"]["effective_workers"] == 2
+    assert "processing_context" in report["resources"]["parallel_stages"]
+    assert "file_optimization" in report["resources"]["sequential_stages"]
+    assert [entry["arquivo"] for entry in report["entries"]] == ["a.md", "b.md"]
 
 
 def test_strict_constructs_auditor_once_and_audits_bundle_once(tmp_path, monkeypatch):

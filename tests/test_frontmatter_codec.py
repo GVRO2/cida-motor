@@ -1,3 +1,5 @@
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 from cida.domain.errors import SemanticValidationError, UnsupportedFrontmatterSyntaxError
@@ -167,3 +169,111 @@ def test_inline_map_empty_key_quoted_key_and_ambiguous_key():
 def test_single_quote_escape_and_double_quote_comment_escape():
     parsed = FrontmatterCodec().decode("single: 'it''s ok'\ndouble: \"a \\\"# not comment\"\n")
     assert parsed == {"single": "it's ok", "double": 'a "# not comment'}
+
+
+def test_double_quoted_unicode_literals_are_preserved():
+    parsed = FrontmatterCodec().decode(
+        'title: "São Paulo"\n'
+        'owner: "João"\n'
+        'description: "ação e validação"\n'
+        'chinese: "你好"\n'
+        'japanese: "こんにちは"\n'
+        'emoji: "🚀"\n'
+        'outside_bmp: "𐍈"\n'
+    )
+
+    assert parsed == {
+        "title": "São Paulo",
+        "owner": "João",
+        "description": "ação e validação",
+        "chinese": "你好",
+        "japanese": "こんにちは",
+        "emoji": "🚀",
+        "outside_bmp": "𐍈",
+    }
+
+
+def test_double_quoted_supported_escapes():
+    parsed = FrontmatterCodec().decode(
+        'quote: "a \\"quote\\""\n'
+        'slash: "a \\\\ slash"\n'
+        'control: "line\\nnext\\rret\\ttab\\bback\\fform"\n'
+        'unicode: "\\u00E7 \\uD83D\\uDE80 \\U00010348"\n'
+    )
+
+    assert parsed["quote"] == 'a "quote"'
+    assert parsed["slash"] == "a \\ slash"
+    assert parsed["control"] == "line\nnext\rret\ttab\bback\fform"
+    assert parsed["unicode"] == "ç 🚀 𐍈"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        'bad: "\\q"\n',
+        'bad: "abc\\"\n',
+        'bad: "\\u12"\n',
+        'bad: "\\uZZZZ"\n',
+        'bad: "\\uD800"\n',
+        'bad: "\\uDC00"\n',
+        'bad: "\\uD800\\u0041"\n',
+        'bad: "\\U00110000"\n',
+    ],
+)
+def test_double_quoted_invalid_escapes_rejected(body: str):
+    with pytest.raises(UnsupportedFrontmatterSyntaxError):
+        FrontmatterCodec().decode(body)
+
+
+def test_single_quoted_backslashes_are_literal():
+    assert FrontmatterCodec().decode("value: 'a \\n literal \\\\'\n") == {"value": "a \\n literal \\\\"}
+
+
+def test_list_items_support_multifield_nested_mappings():
+    parsed = FrontmatterCodec().decode(
+        "items:\n"
+        "  - name: first\n"
+        "    enabled: true\n"
+        "    metadata:\n"
+        "      path: docs/a.md\n"
+        "      tags:\n"
+        "        - stable\n"
+        "        - production\n"
+        "  - name: second\n"
+        "    enabled: false\n"
+    )
+
+    assert parsed == {
+        "items": [
+            {
+                "name": "first",
+                "enabled": True,
+                "metadata": {"path": "docs/a.md", "tags": ["stable", "production"]},
+            },
+            {"name": "second", "enabled": False},
+        ]
+    }
+
+
+def test_list_items_support_dash_then_mapping_and_reject_duplicate_item_key():
+    assert FrontmatterCodec().decode("items:\n  -\n    name: first\n    enabled: true\n") == {
+        "items": [{"name": "first", "enabled": True}]
+    }
+
+    with pytest.raises(UnsupportedFrontmatterSyntaxError, match="Duplicate key"):
+        FrontmatterCodec().decode("items:\n  - name: first\n    name: duplicate\n")
+
+
+def test_frontmatter_codec_instance_is_concurrency_safe():
+    codec = FrontmatterCodec()
+    documents = [
+        'title: "São Paulo"\nitems:\n  - name: first\n    enabled: true\n',
+        'title: "你好"\nitems:\n  - name: second\n    enabled: false\n',
+        'title: "🚀"\nitems:\n  - name: third\n    enabled: true\n',
+    ]
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        results = list(executor.map(codec.decode, documents * 20))
+
+    assert {result["title"] for result in results} == {"São Paulo", "你好", "🚀"}
+    assert all("items" in result for result in results)

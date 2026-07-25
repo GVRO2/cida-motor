@@ -13,10 +13,10 @@ func TestWorkersForProfile(t *testing.T) {
 		{"light two cpus", "light", 2, 1},
 		{"light four cpus", "light", 4, 2},
 		{"light sixteen cpus", "light", 16, 4},
-		{"medium one cpu", "medium", 1, 2},
+		{"medium one cpu", "medium", 1, 1},
 		{"medium eight cpus", "medium", 8, 8},
 		{"medium sixteen cpus", "medium", 16, 10},
-		{"hard one cpu", "hard", 1, 10},
+		{"hard one cpu", "hard", 1, 2},
 		{"hard eight cpus", "hard", 8, 16},
 		{"hard sixty four cpus", "hard", 64, 64},
 	}
@@ -35,15 +35,15 @@ func TestWorkersForProfile(t *testing.T) {
 }
 
 func TestResolveResourceSettings(t *testing.T) {
-	settings, err := resolveResourceSettings("", false, 0, false, func() int { return 16 }, func() int { return 16 })
+	settings, err := resolveResourceSettings("", false, 0, false, 0, false, func() int { return 16 }, func() int { return 16 })
 	if err != nil {
 		t.Fatal(err)
 	}
-	if settings.EffectiveWorkers != 10 || settings.Profile != "default" || settings.ResolutionSource != "default" {
+	if settings.EffectiveWorkers != 10 || settings.EffectiveCPUCapacity != 16 || settings.MaxPythonProcesses != 4 || settings.Profile != "default" || settings.ResolutionSource != "default" {
 		t.Fatalf("unexpected default settings: %+v", settings)
 	}
 
-	settings, err = resolveResourceSettings("hard", true, 8, true, func() int { return 16 }, func() int { return 16 })
+	settings, err = resolveResourceSettings("hard", true, 8, true, 0, false, func() int { return 16 }, func() int { return 16 })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,18 +53,42 @@ func TestResolveResourceSettings(t *testing.T) {
 	if settings.RequestedWorkers == nil || *settings.RequestedWorkers != 8 {
 		t.Fatalf("requested workers not recorded: %+v", settings)
 	}
+
+	settings, err = resolveResourceSettings("", false, 0, false, 0, false, func() int { return 16 }, func() int { return 2 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.EffectiveCPUCapacity != 2 || settings.EffectiveWorkers != 2 || settings.ClampReason != "gomaxprocs" {
+		t.Fatalf("GOMAXPROCS clamp not applied: %+v", settings)
+	}
+
+	settings, err = resolveResourceSettings("hard", true, 0, false, 3, true, func() int { return 16 }, func() int { return 4 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.EffectiveWorkers != 8 || settings.MaxPythonProcesses != 3 {
+		t.Fatalf("python process limit not recorded: %+v", settings)
+	}
 }
 
 func TestResolveResourceSettingsRejectsInvalidValues(t *testing.T) {
 	for _, workers := range []int{0, -1, 257} {
 		t.Run("workers", func(t *testing.T) {
-			if _, err := resolveResourceSettings("", false, workers, true, func() int { return 8 }, func() int { return 8 }); err == nil {
+			if _, err := resolveResourceSettings("", false, workers, true, 0, false, func() int { return 8 }, func() int { return 8 }); err == nil {
 				t.Fatalf("expected invalid workers %d to fail", workers)
 			}
 		})
 	}
 
-	if _, err := resolveResourceSettings("unknown", true, 0, false, func() int { return 8 }, func() int { return 8 }); err == nil {
+	for _, processes := range []int{0, -1, 257} {
+		t.Run("max_python_processes", func(t *testing.T) {
+			if _, err := resolveResourceSettings("", false, 0, false, processes, true, func() int { return 8 }, func() int { return 8 }); err == nil {
+				t.Fatalf("expected invalid max python processes %d to fail", processes)
+			}
+		})
+	}
+
+	if _, err := resolveResourceSettings("unknown", true, 0, false, 0, false, func() int { return 8 }, func() int { return 8 }); err == nil {
 		t.Fatal("expected invalid profile to fail")
 	}
 }
