@@ -256,6 +256,53 @@ jobs:
           performance-balanced-${{ matrix.os }}.json
           performance-strict-${{ matrix.os }}.json
 
+  tknc-context-efficiency:
+    name: TKNC Context Efficiency on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    needs: test
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Python dependencies
+      run: python -m pip install -r requirements-ci.txt
+
+    - name: Runtime Harness Isolation
+      run: python -m pytest tests/test_runtime_harness_decoupling.py -q
+
+    - name: Selective Alias Lookup
+      run: python -m pytest tests/test_selective_alias_resolution.py -q
+
+    - name: Context Usage Benchmark
+      run: python -m pytest tests/test_context_usage_benchmark.py -q
+
+    - name: Context Accuracy Contract
+      run: python -m pytest tests/test_tknc_context_contract.py -q
+
+    - name: No Global Dictionary Preload
+      run: python benchmarks/context_usage_compare.py --output-json context-usage-report-${{ matrix.os }}.json --output-markdown context-usage-report-${{ matrix.os }}.md
+
+    - name: Artifact Upload
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: context-usage-report-${{ matrix.os }}
+        path: |
+          context-usage-report-${{ matrix.os }}.json
+          context-usage-report-${{ matrix.os }}.md
+
   compare:
     name: Compare Manifests
     runs-on: ubuntu-latest
