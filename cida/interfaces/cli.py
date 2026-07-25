@@ -3,6 +3,7 @@ import sys
 import argparse
 import time
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, List
 from cida.domain.errors import (
@@ -13,6 +14,7 @@ from cida.infrastructure.filesystem import PhysicalFilesystem, validate_filesyst
 from cida.infrastructure.tokenizer import OfflineTokenizer
 from cida.infrastructure.hashing import HashService
 from cida.infrastructure.json_codec import JsonCodec
+from cida.application.optimize_file import FileOptimizerUsecase
 from cida.application.optimize_corpus import CorpusOptimizerUsecase
 from cida.application.generate_report import ReportGeneratorUsecase
 from cida.domain.processing_context import ProcessingContext
@@ -123,6 +125,66 @@ def _build_processing_context(
         original_tokens=token_counter.count(source_text, content_hash=source_sha256),
         detected_profile=detected_profile,
     )
+
+
+def _build_processing_context_isolated(
+    filepath: str,
+    src_abs: str,
+    requested_profile: str,
+    enable_cache: bool,
+) -> ProcessingContext:
+    file_repo = PhysicalFilesystem()
+    token_counter = OfflineTokenizer(enable_cache=enable_cache)
+    hash_service = HashService()
+    json_codec = JsonCodec()
+    file_opt = FileOptimizerUsecase(token_counter, file_repo, hash_service, json_codec)
+    return _build_processing_context(filepath, src_abs, requested_profile, file_repo, file_opt, hash_service, token_counter)
+
+
+def _build_processing_contexts(
+    files: list[str],
+    src_abs: str,
+    requested_profile: str,
+    workers: int,
+    enable_cache: bool,
+    file_repo: PhysicalFilesystem,
+    file_opt: Any,
+    hash_service: HashService,
+    token_counter: OfflineTokenizer,
+) -> tuple[dict[str, ProcessingContext], dict[str, Exception], bool]:
+    if workers <= 1 or len(files) <= 1:
+        contexts: dict[str, ProcessingContext] = {}
+        errors: dict[str, Exception] = {}
+        for filepath in files:
+            try:
+                contexts[filepath] = _build_processing_context(
+                    filepath, src_abs, requested_profile, file_repo, file_opt, hash_service, token_counter
+                )
+            except Exception as exc:
+                errors[filepath] = exc
+        return contexts, errors, False
+
+    contexts = {}
+    errors = {}
+    effective_workers = min(workers, len(files))
+    with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+        future_by_path = {
+            executor.submit(
+                _build_processing_context_isolated,
+                filepath,
+                src_abs,
+                requested_profile,
+                enable_cache,
+            ): filepath
+            for filepath in files
+        }
+        for future in as_completed(future_by_path):
+            filepath = future_by_path[future]
+            try:
+                contexts[filepath] = future.result()
+            except Exception as exc:
+                errors[filepath] = exc
+    return contexts, errors, True
 
 
 def _accept_token_reducing_candidate(
@@ -330,7 +392,7 @@ def main():
 
         report_gen = ReportGeneratorUsecase(file_repo, json_codec)
         report_gen.set_report_schema(args.report_schema)
-        report_gen.set_resources({
+        resource_metadata = {
             "logical_cpus": args.logical_cpus or os.cpu_count() or 1,
             "gomaxprocs": args.gomaxprocs,
             "effective_cpu_capacity": args.effective_cpu_capacity or min(args.logical_cpus or os.cpu_count() or 1, args.gomaxprocs or args.logical_cpus or os.cpu_count() or 1),
@@ -342,16 +404,16 @@ def main():
             "python_parallel_execution": False,
             "parallel_stages": [],
             "sequential_stages": [
-                "file_processing",
                 "corpus_dictionary",
+                "file_optimization",
                 "report_aggregation",
                 "strict_audit",
                 "transactional_promotion",
             ],
-        })
+        }
+        report_gen.set_resources(resource_metadata)
         file_opt = None
         if args.profile == "auto" or args.dictionary_scope == "file":
-            from cida.application.optimize_file import FileOptimizerUsecase
             file_opt = FileOptimizerUsecase(token_counter, file_repo, hash_service, json_codec)
         semantic_dependencies: tuple[type[Any], Any] | None = None
 
@@ -406,6 +468,8 @@ def main():
         auxiliary_tokens = 0
 
         content_cache: dict[str, ProcessingContext] = {}
+        context_failures: dict[str, Exception] = {}
+        python_context_parallel_enabled = False
 
         if args.dictionary_scope == "corpus":
             from cida.markdown.dictionary import apply_dictionary
@@ -418,16 +482,24 @@ def main():
             if corpus_dict:
                 total_orig_tokens = 0
                 total_mini_tokens = 0
+                content_cache, context_failures, python_context_parallel_enabled = _build_processing_contexts(
+                    files_to_process,
+                    src_abs,
+                    args.profile,
+                    args.workers,
+                    not args.no_cache,
+                    file_repo,
+                    file_opt,
+                    hash_service,
+                    token_counter,
+                )
                 for fp in files_to_process:
-                    try:
-                        ctx = _build_processing_context(
-                            fp, src_abs, args.profile, file_repo, file_opt, hash_service, token_counter
-                        )
-                        content_cache[fp] = ctx
-                    except Exception as exc:
+                    if fp in context_failures:
+                        exc = context_failures[fp]
                         raise SourcePathError(
                             f"Failed to read corpus source for token estimation '{fp}': {exc}"
                         ) from exc
+                    ctx = content_cache[fp]
                     c = ctx.source_text
                     total_orig_tokens += ctx.original_tokens
                     prof = ctx.detected_profile
@@ -472,10 +544,44 @@ def main():
         inflation_detected = False
         aggregator = FailureAggregator()
 
+        if args.dictionary_scope != "corpus":
+            content_cache, context_failures, python_context_parallel_enabled = _build_processing_contexts(
+                files_to_process,
+                src_abs,
+                args.profile,
+                args.workers,
+                not args.no_cache,
+                file_repo,
+                file_opt,
+                hash_service,
+                token_counter,
+            )
+
+        if python_context_parallel_enabled:
+            resource_metadata["python_parallel_execution"] = True
+            resource_metadata["parallel_stages"] = [
+                "file_read",
+                "file_classification",
+                "file_hash",
+                "file_tokenization",
+                "processing_context",
+            ]
+            resource_metadata["sequential_stages"] = [
+                "corpus_dictionary",
+                "file_optimization",
+                "semantic_validation",
+                "report_aggregation",
+                "strict_audit",
+                "transactional_promotion",
+            ]
+            report_gen.set_resources(resource_metadata)
+
         for filepath in files_to_process:
             start_time = time.time()
 
             try:
+                if filepath in context_failures:
+                    raise context_failures[filepath]
                 if filepath in content_cache:
                     ctx = content_cache.pop(filepath)
                 else:
