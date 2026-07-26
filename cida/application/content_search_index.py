@@ -13,7 +13,16 @@ SEARCH_INDEX_SCHEMA_VERSION = 1
 SEARCH_SEGMENT_SCHEMA_VERSION = 1
 MAX_POSTINGS_PER_TERM = 2_000
 MAX_TERMS_PER_FILE = 2_000
+SINGLE_SEGMENT_FILE_LIMIT = 16
+SINGLE_SEGMENT_ID = "all"
 TERM_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+ALPHA_SEGMENT_BUCKETS = (
+    ("a", "f", "a-f"),
+    ("g", "l", "g-l"),
+    ("m", "r", "m-r"),
+    ("s", "z", "s-z"),
+)
+VALID_SEARCH_SEGMENTS = {SINGLE_SEGMENT_ID, "_", "0-9", *(bucket for _, _, bucket in ALPHA_SEGMENT_BUCKETS)}
 
 
 @dataclass(frozen=True)
@@ -37,8 +46,12 @@ def segment_id_for_term(term: str) -> str:
     if not normalized:
         return "_"
     first = normalized[0]
-    if first.isascii() and first.isalnum():
-        return first
+    if first.isascii() and first.isdigit():
+        return "0-9"
+    if first.isascii() and first.isalpha():
+        for start, end, bucket in ALPHA_SEGMENT_BUCKETS:
+            if start <= first <= end:
+                return bucket
     return "_"
 
 
@@ -59,9 +72,10 @@ def build_content_search_index_artifacts(
         for term in tuple(dict.fromkeys((*path_terms, *content_terms)))[:MAX_TERMS_PER_FILE]:
             postings.setdefault(term, set()).add(safe_path)
 
+    single_segment = 0 < file_count <= SINGLE_SEGMENT_FILE_LIMIT
     terms_by_segment: dict[str, dict[str, list[str]]] = {}
     for term, paths in sorted(postings.items()):
-        segment_id = segment_id_for_term(term)
+        segment_id = SINGLE_SEGMENT_ID if single_segment else segment_id_for_term(term)
         terms_by_segment.setdefault(segment_id, {})[term] = sorted(paths)[:MAX_POSTINGS_PER_TERM]
 
     segments: dict[str, dict[str, Any]] = {}
@@ -91,6 +105,7 @@ def build_content_search_index_artifacts(
         "corpus_id": corpus_id,
         "segment_count": len(segment_metadata),
         "file_count": file_count,
+        "segmentation": "single" if single_segment else "bucket",
         "segments": segment_metadata,
     }
     root["index_sha256"] = hash_service.sha256(json_codec.canonical_encode(_canonical_root_payload(root)).encode("utf-8"))
@@ -111,8 +126,10 @@ def validate_content_search_index(root: dict[str, Any], *, hash_service: Any, js
         raise SidecarValidationError("Content search index segments must be an object")
     if root.get("segment_count") != len(segments):
         raise SidecarValidationError("Content search index segment_count mismatch")
+    if root.get("segmentation", "bucket") not in {"single", "bucket"}:
+        raise SidecarValidationError(f"Unsupported content search index segmentation: {root.get('segmentation')}")
     for segment_id, metadata in segments.items():
-        if segment_id_for_term(segment_id) != segment_id and segment_id != "_":
+        if segment_id not in VALID_SEARCH_SEGMENTS:
             raise SidecarValidationError(f"Invalid content search segment id: {segment_id}")
         if not isinstance(metadata, dict):
             raise SidecarValidationError(f"Content search segment metadata must be an object: {segment_id}")
@@ -155,7 +172,7 @@ def validate_content_search_segment(
     if not isinstance(terms, dict):
         raise SidecarValidationError("Content search segment terms must be an object")
     for term, paths in terms.items():
-        if segment_id_for_term(term) != segment_id:
+        if segment_id != SINGLE_SEGMENT_ID and segment_id_for_term(term) != segment_id:
             raise SidecarValidationError(f"Content search term stored in wrong segment: {term}")
         if not isinstance(paths, list):
             raise SidecarValidationError(f"Content search postings must be a list: {term}")
@@ -173,6 +190,7 @@ def _canonical_root_payload(root: dict[str, Any]) -> dict[str, Any]:
         "corpus_id": root.get("corpus_id"),
         "segment_count": root.get("segment_count"),
         "file_count": root.get("file_count"),
+        "segmentation": root.get("segmentation", "bucket"),
         "segments": root.get("segments", {}),
     }
 

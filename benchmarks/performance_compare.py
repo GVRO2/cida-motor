@@ -333,6 +333,37 @@ def _compute_tree_sha256(output_dir: Path) -> str:
     return hashlib.sha256(manifest_bytes).hexdigest()
 
 
+def _implementation_fingerprint(project: Path, runner: str) -> str:
+    if runner == "go":
+        paths = sorted(path for path in project.rglob("*.go") if ".git" not in path.parts)
+        for name in ("go.mod", "go.sum"):
+            candidate = project / name
+            if candidate.exists():
+                paths.append(candidate)
+    else:
+        paths = [
+            path
+            for path in [
+                project / "token_optimizer.py",
+                project / "translate.py",
+                project / "decompress.py",
+            ]
+            if path.exists()
+        ]
+        cida_dir = project / "cida"
+        if cida_dir.exists():
+            paths.extend(sorted(path for path in cida_dir.rglob("*.py") if ".git" not in path.parts))
+
+    digest = hashlib.sha256()
+    for path in sorted(set(paths)):
+        rel = path.relative_to(project).as_posix()
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def _p95(values: list[float]) -> float:
     if not values:
         return 0.0
@@ -512,6 +543,9 @@ def main() -> None:
             cmd_str = f"motor_v3 {' '.join(flags)}" if runner == "go" else f"python -m cida.interfaces.cli {' '.join(flags)}"
             max_attempts = MAX_BALANCED_SCENARIO_ATTEMPTS if args.validation_level == "balanced" else 1
             attempt_summaries = []
+            base_implementation_sha256 = _implementation_fingerprint(base_dir, runner)
+            head_implementation_sha256 = _implementation_fingerprint(head_dir, runner)
+            implementation_delta = base_implementation_sha256 != head_implementation_sha256
 
             for attempt in range(1, max_attempts + 1):
                 samples_map = {"base": [], "head": []}
@@ -546,21 +580,28 @@ def main() -> None:
                     "p95_delta": _delta(head_summary["p95"], base_summary["p95"]),
                     "peak_rss_delta": _delta(head_summary["peak_rss"], base_summary["peak_rss"]),
                 }
-                budget_result = (
+                raw_budget_result = (
                     comparison["median_delta"] <= MEDIAN_BUDGET
                     and comparison["p95_delta"] <= P95_BUDGET
                     and comparison["peak_rss_delta"] <= RSS_BUDGET
                 )
                 is_unstable = base_summary["cv"] > STABILITY_CV_LIMIT or head_summary["cv"] > STABILITY_CV_LIMIT
                 stability_str = "UNSTABLE" if is_unstable else "STABLE"
-                gate_result = budget_result and not is_unstable
+                output_equivalent = base_summary["output_tree_sha256"] == head_summary["output_tree_sha256"]
+                timing_gate_skipped = args.validation_level == "balanced" and not implementation_delta
+                budget_result = raw_budget_result or timing_gate_skipped
+                gate_result = True if timing_gate_skipped else budget_result and not is_unstable
                 attempt_summaries.append(
                     {
                         "attempt": attempt,
                         "budget_result": "PASS" if budget_result else "FAIL",
+                        "raw_budget_result": "PASS" if raw_budget_result else "FAIL",
                         "stability": stability_str,
                         "base_cv": base_summary["cv"],
                         "head_cv": head_summary["cv"],
+                        "implementation_delta": implementation_delta,
+                        "output_equivalent": output_equivalent,
+                        "timing_gate_skipped_reason": "SKIPPED_NO_IMPLEMENTATION_DELTA" if timing_gate_skipped else "",
                         "comparison": comparison,
                     }
                 )
@@ -593,7 +634,13 @@ def main() -> None:
                     "head": head_summary,
                     "comparison": comparison,
                     "stability": stability_str,
+                    "base_implementation_sha256": base_implementation_sha256,
+                    "head_implementation_sha256": head_implementation_sha256,
+                    "implementation_delta": implementation_delta,
+                    "output_equivalent": output_equivalent,
+                    "timing_gate_skipped_reason": "SKIPPED_NO_IMPLEMENTATION_DELTA" if timing_gate_skipped else "",
                     "budget_result": "PASS" if budget_result else "FAIL",
+                    "raw_budget_result": "PASS" if raw_budget_result else "FAIL",
                     "stability_result": "FAIL" if is_unstable else "PASS",
                     "gate_result": "PASS" if gate_result else "FAIL",
                     "budget_enforced": args.validation_level == "balanced",

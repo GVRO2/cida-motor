@@ -56,6 +56,7 @@ def test_content_search_index_root_hash_validates():
         json_codec=jc,
     )
 
+    assert artifacts.root["segmentation"] == "single"
     validate_content_search_index(artifacts.root, hash_service=hs, json_codec=jc)
 
 
@@ -64,6 +65,10 @@ def test_content_search_index_normalizes_long_terms_and_fallback_segments():
 
     assert normalize_terms(long_term) == (("a" + ("b" * 63)),)
     assert segment_id_for_term("") == "_"
+    assert segment_id_for_term("alpha") == "a-f"
+    assert segment_id_for_term("needle") == "m-r"
+    assert segment_id_for_term("token") == "s-z"
+    assert segment_id_for_term("123token") == "0-9"
     assert segment_id_for_term("_needle") == "_"
 
 
@@ -88,21 +93,21 @@ def test_content_search_index_rejects_invalid_root_and_segment_shapes():
         validate_content_search_index(root, hash_service=hs, json_codec=jc)
 
     root = dict(artifacts.root)
-    root["segments"] = {"a": []}
+    root["segments"] = {"a-f": []}
     root["segment_count"] = 1
     with pytest.raises(SidecarValidationError, match="metadata"):
         validate_content_search_index(root, hash_service=hs, json_codec=jc)
 
     root = dict(artifacts.root)
-    root["segments"] = {"a": {"path": 1}}
+    root["segments"] = {"a-f": {"path": 1}}
     root["segment_count"] = 1
     with pytest.raises(SidecarValidationError, match="segment path"):
         validate_content_search_index(root, hash_service=hs, json_codec=jc)
 
     root = dict(artifacts.root)
     root["segments"] = {
-        "a": {
-            "path": "search-index/segment-a.json",
+        "a-f": {
+            "path": "search-index/segment-a-f.json",
             "sha256": next(iter(artifacts.segments.values()))["segment_sha256"],
             "term_count": -1,
         }
@@ -114,7 +119,7 @@ def test_content_search_index_rejects_invalid_root_and_segment_shapes():
     with pytest.raises(SidecarValidationError, match="JSON object"):
         validate_content_search_segment(
             [],
-            segment_id="a",
+            segment_id="a-f",
             expected_sha256="0" * 64,
             corpus_id=corpus_id,
             hash_service=hs,
@@ -126,8 +131,8 @@ def test_content_search_index_rejects_invalid_root_and_segment_shapes():
 
     root = dict(artifacts.root)
     root["segments"] = {
-        "a": {
-            "path": "search-index/segment-a/../bad.json",
+        "a-f": {
+            "path": "search-index/segment-a-f/../bad.json",
             "sha256": next(iter(artifacts.segments.values()))["segment_sha256"],
             "term_count": 1,
         }

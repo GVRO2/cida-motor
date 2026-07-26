@@ -13,9 +13,11 @@ def build_bundle_manifest(
     hash_service: Any,
     json_codec: Any,
     source_manifest_sha256: str,
+    precomputed_hashes: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     files = []
     manifest_rel = f"tknd/{BUNDLE_MANIFEST_FILENAME}"
+    precomputed_hashes = precomputed_hashes or {}
     for path in sorted(file_repo.list_files(dst_abs)):
         rel = file_repo.relpath(path, dst_abs).replace("\\", "/")
         if rel == manifest_rel:
@@ -26,7 +28,7 @@ def build_bundle_manifest(
         files.append(
             {
                 "path": rel,
-                "sha256": hash_service.sha256(file_repo.read_bytes(path)),
+                "sha256": precomputed_hashes.get(rel) or hash_service.sha256(file_repo.read_bytes(path)),
                 "artifact_type": artifact_type,
             }
         )

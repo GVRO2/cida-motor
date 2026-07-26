@@ -128,9 +128,10 @@ class CorpusOptimizerUsecase:
 
         return corpus_dict, corpus_hash, sidecar_tokens_total, auxiliary_tokens
 
-    def write_corpus_sidecars(self, corpus_dict: dict, corpus_hash: str, dst_abs: str) -> None:
+    def write_corpus_sidecars(self, corpus_dict: dict, corpus_hash: str, dst_abs: str) -> dict[str, str]:
         if not corpus_dict:
-            return
+            return {}
+        artifact_hashes: dict[str, str] = {}
         items = self._items_sorted_by_alias(corpus_dict)
         tknd_dir = self.file_repo.join(dst_abs, "tknd")
         self.file_repo.makedirs(tknd_dir)
@@ -163,7 +164,9 @@ class CorpusOptimizerUsecase:
             dict_file_path = self.file_repo.join(tknd_dir, chunk_filename)
             serialized = self.json_codec.encode(sidecar_data, indent=4)
             self.file_repo.write_text(dict_file_path, serialized)
-            chunk_hashes[chunk_filename] = self.hash_service.sha256(serialized.encode("utf-8"))
+            chunk_hash = self.hash_service.sha256(serialized.encode("utf-8"))
+            chunk_hashes[chunk_filename] = chunk_hash
+            artifact_hashes[f"tknd/{chunk_filename}"] = chunk_hash
             chunk_entry_counts[chunk_filename] = len(entries_map)
             chunk_entries_sha256[chunk_filename] = entries_sha256
             for alias in entries_map:
@@ -183,9 +186,16 @@ class CorpusOptimizerUsecase:
         )
         for segment_path, segment_data in sorted(index_artifacts.segments.items()):
             full_segment_path = self.file_repo.join(tknd_dir, *segment_path.split("/"))
-            self.file_repo.write_text(full_segment_path, self.json_codec.encode(segment_data, indent=4))
+            segment_text = self.json_codec.encode(segment_data, indent=4)
+            self.file_repo.write_text(full_segment_path, segment_text)
+            artifact_hashes[f"tknd/{segment_path}"] = self.hash_service.sha256(segment_text.encode("utf-8"))
         index_path = self.file_repo.join(tknd_dir, ALIAS_INDEX_FILENAME)
-        self.file_repo.write_text(index_path, self.json_codec.encode(index_artifacts.root, indent=4))
+        index_text = self.json_codec.encode(index_artifacts.root, indent=4)
+        self.file_repo.write_text(index_path, index_text)
+        artifact_hashes[f"tknd/{ALIAS_INDEX_FILENAME}"] = self.hash_service.sha256(index_text.encode("utf-8"))
         if self._last_manifest is not None:
             manifest_path = self.file_repo.join(dst_abs, "tknc-manifest.json")
-            self.file_repo.write_text(manifest_path, self.json_codec.encode(self._last_manifest, indent=4))
+            manifest_text = self.json_codec.encode(self._last_manifest, indent=4)
+            self.file_repo.write_text(manifest_path, manifest_text)
+            artifact_hashes["tknc-manifest.json"] = self.hash_service.sha256(manifest_text.encode("utf-8"))
+        return artifact_hashes

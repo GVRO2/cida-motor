@@ -138,9 +138,9 @@ def test_content_search_index_rejects_invalid_roots(mutation, message):
         (lambda segment: segment.update({"format": "wrong"}), "format"),
         (lambda segment: segment.update({"schema_version": 99}), "schema"),
         (lambda segment: segment.update({"corpus_id": "0" * 64}), "corpus_id"),
-        (lambda segment: segment.update({"segment_id": "z"}), "id mismatch"),
+        (lambda segment: segment.update({"segment_id": "s-z"}), "id mismatch"),
         (lambda segment: segment.update({"terms": []}), "terms"),
-        (lambda segment: segment["terms"].update({"zterm": ["a.py.tknc"]}), "wrong segment"),
+        (lambda segment: segment["terms"].update({"sierra": ["a.py.tknc"]}), "wrong segment"),
         (lambda segment: segment["terms"].update({"alpha": "../bad.py"}), "postings"),
         (lambda segment: segment.update({"segment_sha256": "bad"}), "hash"),
     ],
@@ -148,14 +148,20 @@ def test_content_search_index_rejects_invalid_roots(mutation, message):
 def test_content_search_segment_rejects_invalid_shapes(mutation, message):
     hs = HashService()
     jc = JsonCodec()
-    artifacts = build_content_search_index_artifacts([("a.py.tknc", "alpha needle")], corpus_id=hs.sha256(b"corpus"), hash_service=hs, json_codec=jc)
+    artifacts = build_content_search_index_artifacts(
+        [(f"a{i:02d}.py.tknc", "alpha needle") for i in range(17)],
+        corpus_id=hs.sha256(b"corpus"),
+        hash_service=hs,
+        json_codec=jc,
+    )
     segment = json.loads(json.dumps(next(iter(artifacts.segments.values()))))
+    segment_id = segment["segment_id"]
     mutation(segment)
 
     with pytest.raises(SidecarValidationError, match=message):
         validate_content_search_segment(
             segment,
-            segment_id="a",
+            segment_id=segment_id,
             expected_sha256=next(iter(artifacts.segments.values()))["segment_sha256"],
             corpus_id=artifacts.root["corpus_id"],
             hash_service=hs,

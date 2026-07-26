@@ -224,9 +224,9 @@ def _write_content_search_index(
     json_codec: JsonCodec,
     hash_service: HashService,
     corpus_hash: str,
-) -> None:
+) -> dict[str, str]:
     if not generated_bundles:
-        return
+        return {}
     from cida.application.content_search_index import SEARCH_INDEX_FILENAME, build_content_search_index_artifacts
 
     indexed_files: list[tuple[str, str]] = []
@@ -240,7 +240,9 @@ def _write_content_search_index(
         indexed_files.append((rel_path, text))
         output_hashes[rel_path] = hash_service.sha256(out_bytes)
     if not indexed_files:
-        return
+        return output_hashes
+    if len(indexed_files) == 1 and not corpus_hash:
+        return output_hashes
     corpus_id = corpus_hash or hash_service.sha256(json_codec.canonical_encode(output_hashes).encode("utf-8"))
     artifacts = build_content_search_index_artifacts(
         indexed_files,
@@ -252,8 +254,13 @@ def _write_content_search_index(
     file_repo.makedirs(tknd_dir)
     for segment_path, segment_data in sorted(artifacts.segments.items()):
         full_segment_path = file_repo.join(tknd_dir, *segment_path.split("/"))
-        file_repo.write_text(full_segment_path, json_codec.encode(segment_data, indent=4))
-    file_repo.write_text(file_repo.join(tknd_dir, SEARCH_INDEX_FILENAME), json_codec.encode(artifacts.root, indent=4))
+        segment_text = json_codec.encode(segment_data, indent=4)
+        file_repo.write_text(full_segment_path, segment_text)
+        output_hashes[f"tknd/{segment_path}"] = hash_service.sha256(segment_text.encode("utf-8"))
+    root_text = json_codec.encode(artifacts.root, indent=4)
+    file_repo.write_text(file_repo.join(tknd_dir, SEARCH_INDEX_FILENAME), root_text)
+    output_hashes[f"tknd/{SEARCH_INDEX_FILENAME}"] = hash_service.sha256(root_text.encode("utf-8"))
+    return output_hashes
 
 
 def _write_bundle_manifest(
@@ -262,6 +269,7 @@ def _write_bundle_manifest(
     json_codec: JsonCodec,
     hash_service: HashService,
     source_manifest_sha256: str,
+    precomputed_hashes: dict[str, str] | None = None,
 ) -> None:
     from cida.application.bundle_manifest import BUNDLE_MANIFEST_FILENAME, build_bundle_manifest
 
@@ -271,6 +279,7 @@ def _write_bundle_manifest(
         hash_service=hash_service,
         json_codec=json_codec,
         source_manifest_sha256=source_manifest_sha256,
+        precomputed_hashes=precomputed_hashes,
     )
     tknd_dir = file_repo.join(dst_abs, "tknd")
     file_repo.makedirs(tknd_dir)
@@ -435,6 +444,7 @@ def main():
 
         java_raw_metrics = []
         generated_bundles = []
+        artifact_hashes: dict[str, str] = {}
 
         java_processed_relpaths = set()
         if args.java_raw_json and file_repo.exists(args.java_raw_json):
@@ -592,7 +602,7 @@ def main():
                         corpus_hash = ""
                     else:
                         if not args.dry_run:
-                            corpus_opt.write_corpus_sidecars(corpus_dict, corpus_hash, dst_abs)
+                            artifact_hashes.update(corpus_opt.write_corpus_sidecars(corpus_dict, corpus_hash, dst_abs))
                 else:
                     corpus_dict = {}
                     corpus_hash = ""
@@ -882,8 +892,11 @@ def main():
             if not args.dry_run:
                 out_bytes = text_to_write.encode('utf-8')
                 file_repo.write_bytes(dest_path, out_bytes)
+                artifact_hashes[file_repo.relpath(dest_path, dst_abs).replace("\\", "/")] = hash_service.sha256(out_bytes)
                 if sidecar_path:
-                    file_repo.write_text(sidecar_path, json_codec.encode(best_sidecar_data, indent=4))
+                    sidecar_text = json_codec.encode(best_sidecar_data, indent=4)
+                    file_repo.write_text(sidecar_path, sidecar_text)
+                    artifact_hashes[file_repo.relpath(sidecar_path, dst_abs).replace("\\", "/")] = hash_service.sha256(sidecar_text.encode("utf-8"))
                 generated_bundles.append((filepath, dest_path, sidecar_path, content_bytes, out_bytes))
 
             final_written_tokens = final_tokens if text_to_write == final_text else token_counter.count(text_to_write)
@@ -907,9 +920,9 @@ def main():
             )
 
         if not args.dry_run:
-            _write_content_search_index(dst_abs, generated_bundles, file_repo, json_codec, hash_service, corpus_hash)
+            artifact_hashes.update(_write_content_search_index(dst_abs, generated_bundles, file_repo, json_codec, hash_service, corpus_hash))
             source_manifest_sha256 = corpus_hash or hash_service.sha256(b"no-source-manifest")
-            _write_bundle_manifest(dst_abs, file_repo, json_codec, hash_service, source_manifest_sha256)
+            _write_bundle_manifest(dst_abs, file_repo, json_codec, hash_service, source_manifest_sha256, artifact_hashes)
 
         report_name = args.report_path
         if not args.dry_run and args.report in ["text", "both", "json"]:

@@ -7,6 +7,7 @@ from typing import Any
 
 from cida.application.content_search_index import (
     SEARCH_INDEX_FILENAME,
+    SINGLE_SEGMENT_ID,
     normalize_terms,
     segment_id_for_term,
     validate_content_search_index,
@@ -315,7 +316,10 @@ def _search_context_indexed(
     index_data = json_codec.decode(root_text)
     validate_content_search_index(index_data, hash_service=hash_service, json_codec=json_codec)
     query_terms = tuple(dict.fromkeys(term for item in terms for term in normalize_terms(item)))
-    segment_ids = sorted({segment_id_for_term(term) for term in query_terms})
+    if index_data.get("segmentation") == "single":
+        segment_ids = [SINGLE_SEGMENT_ID]
+    else:
+        segment_ids = sorted({segment_id_for_term(term) for term in query_terms})
     candidates: set[str] = set()
     segments_loaded = 0
     for segment_id in segment_ids:
