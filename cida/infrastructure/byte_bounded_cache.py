@@ -10,6 +10,10 @@ class CacheEntry:
     pinned: bool = False
 
 
+class PinnedCacheBudgetError(ValueError):
+    pass
+
+
 class ByteBoundedLRUCache:
     def __init__(self, max_bytes: int, max_items: int) -> None:
         if max_bytes < 0:
@@ -43,6 +47,8 @@ class ByteBoundedLRUCache:
         if self.max_bytes == 0 or self.max_items == 0 or size > self.max_bytes:
             self.oversized_rejections += 1
             self.bypass_oversized_items += 1
+            if pinned:
+                raise PinnedCacheBudgetError("Pinned cache entry exceeds the configured byte or item budget")
             return False
         existing = self._items.pop(key, None)
         if existing is not None:
@@ -54,6 +60,8 @@ class ByteBoundedLRUCache:
             self._items.pop(key, None)
             self._subtract(entry)
             self.oversized_rejections += 1
+            if pinned:
+                raise PinnedCacheBudgetError("Pinned cache entries exceed the configured byte or item budget")
             return False
         self.peak_bytes = max(self.peak_bytes, self.current_bytes)
         return True
@@ -106,9 +114,6 @@ class ByteBoundedLRUCache:
             if key == protect_key:
                 continue
             if not entry.pinned:
-                return key
-        for key in self._items:
-            if key != protect_key:
                 return key
         return None
 

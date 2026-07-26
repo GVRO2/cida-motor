@@ -3,7 +3,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from cida.application.content_search_index import (
     SEARCH_INDEX_FILENAME,
@@ -23,6 +23,8 @@ from cida.application.selective_alias_resolution import (
 from cida.domain.alias_codec import DEFAULT_ALIAS_CODEC
 from cida.domain.errors import SidecarValidationError
 from cida.infrastructure.byte_bounded_cache import ByteBoundedLRUCache
+from cida.infrastructure.bundle_runtime_verifier import BundleRuntimeVerifier, find_bundle_root
+from cida.infrastructure.managed_memory import ManagedMemoryAccounting
 from cida.infrastructure.filesystem import PhysicalFilesystem
 
 
@@ -41,22 +43,6 @@ STOPWORDS = {
     "dos",
     "das",
     "main",
-}
-TERM_EXPANSIONS = {
-    "componente": ("main", "processarEComparar"),
-    "inicia": ("main", "processarEComparar"),
-    "principal": ("main", "motor_v3", "cli"),
-    "processamento": ("workflow",),
-    "auxiliares": ("write_corpus_sidecars", "tknd", "alias-index", "cidatkn"),
-    "aliases": ("alias", "entries", "reconstruct_content"),
-    "original": ("reconstruct_content", "entries", "replace"),
-    "workers": ("ResourceProfiles", "resolveEffectiveWorkers"),
-    "efetiva": ("resolveEffectiveWorkers", "worker"),
-    "tokens": ("tokenizer", "count_tokens"),
-    "contar": ("count_tokens", "tokenizer"),
-    "vocabulario": ("lexicon",),
-    "comprimido": ("lexicon",),
-    "referencia": ("lexicon",),
 }
 
 
@@ -129,8 +115,10 @@ def artifact_type(path: Path) -> str:
         return "manifest"
     if path.name == "bundle-manifest.json":
         return "bundle_manifest"
-    if path.name == SEARCH_INDEX_FILENAME or "search-index" in _parts(path):
+    if path.name == SEARCH_INDEX_FILENAME:
         return "search_index"
+    if "search-index" in _parts(path):
+        return "search_segment"
     if path.name.startswith("report"):
         return "report"
     if is_content_artifact(path):
@@ -144,6 +132,7 @@ class ContextFilesystem(PhysicalFilesystem):
         self._started = time.perf_counter()
         self.reads: list[ContextReadEvent] = []
         self._cache = ByteBoundedLRUCache(max_bytes=max_cache_bytes, max_items=max_cache_items)
+        self._bundle_verifiers: dict[Path, BundleRuntimeVerifier] = {}
 
     def read_bytes_limited(
         self,
@@ -164,12 +153,12 @@ class ContextFilesystem(PhysicalFilesystem):
                 raise SidecarValidationError(f"Context artifact exceeds requested size limit: {filepath}")
         else:
             cache_hit = False
-            data = super().read_bytes_limited(filepath, max_bytes)
+            data = self._read_verified_or_physical(Path(filepath), current_artifact_type, max_bytes)
             self._cache.put(
                 path_key,
                 data,
                 artifact_type=current_artifact_type,
-                pinned=current_artifact_type in {"alias_index", "manifest"},
+                pinned=current_artifact_type in {"alias_index", "manifest", "bundle_manifest", "search_index"},
             )
         self.reads.append(
             ContextReadEvent(
@@ -184,6 +173,23 @@ class ContextFilesystem(PhysicalFilesystem):
                 relative_timestamp_ms=(time.perf_counter() - self._started) * 1000.0,
             )
         )
+        return data
+
+    def _read_verified_or_physical(self, path: Path, current_artifact_type: str, max_bytes: int) -> bytes:
+        bundle_root = find_bundle_root(path)
+        if bundle_root is None:
+            return super().read_bytes_limited(str(path), max_bytes)
+        verifier = self._bundle_verifiers.get(bundle_root)
+        if verifier is None:
+            verifier = BundleRuntimeVerifier(bundle_root)
+            self._bundle_verifiers[bundle_root] = verifier
+        expected_type = _bundle_artifact_type(current_artifact_type)
+        try:
+            data = verifier.read_verified_bytes(path, expected_type=expected_type)
+        except ValueError as exc:
+            raise SidecarValidationError(str(exc)) from exc
+        if len(data) > max_bytes:
+            raise SidecarValidationError(f"Context artifact exceeds requested size limit: {path}")
         return data
 
     def read_text_limited(
@@ -228,12 +234,10 @@ class ContextFilesystem(PhysicalFilesystem):
 
 
 def question_terms(question: str) -> tuple[str, ...]:
-    raw = re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", question)
     terms: list[str] = []
-    for term in raw:
-        if term.lower() not in STOPWORDS:
+    for term in normalize_terms(question):
+        if term not in STOPWORDS:
             terms.append(term)
-        terms.extend(TERM_EXPANSIONS.get(term.lower(), ()))
     return tuple(dict.fromkeys(terms))
 
 
@@ -321,6 +325,7 @@ def _search_context_indexed(
     else:
         segment_ids = sorted({segment_id_for_term(term) for term in query_terms})
     candidates: set[str] = set()
+    candidate_term_hits: dict[str, int] = {}
     segments_loaded = 0
     for segment_id in segment_ids:
         metadata = index_data["segments"].get(segment_id)
@@ -347,7 +352,9 @@ def _search_context_indexed(
         )
         segments_loaded += 1
         for term in query_terms:
-            candidates.update(segment["terms"].get(term, []))
+            for rel in segment["terms"].get(term, []):
+                candidates.add(rel)
+                candidate_term_hits[rel] = candidate_term_hits.get(rel, 0) + 1
     scored: list[tuple[int, str, str]] = []
     content_bytes = 0
     opened = 0
@@ -364,7 +371,7 @@ def _search_context_indexed(
         )
         opened += 1
         content_bytes += len(text.encode("utf-8"))
-        score = _score_text(rel, text, terms)
+        score = _score_text(rel, text, terms) + candidate_term_hits.get(rel, 0) * 10
         if score:
             scored.append((score, rel, text))
     scored.sort(key=lambda item: (-item[0], item[1]))
@@ -463,6 +470,7 @@ class TkncContextSession:
     cache_hits: int = 0
     cache_misses: int = 0
     closed: bool = False
+    managed_total_peak_bytes: int = 0
 
     def close(self) -> None:
         self.index_data = None
@@ -475,6 +483,7 @@ class TkncContextSession:
         self.fs.clear_cache(reset_stats=True)
         self.cache_hits = 0
         self.cache_misses = 0
+        self.managed_total_peak_bytes = 0
         self.closed = True
 
     @property
@@ -586,6 +595,17 @@ class TkncContextSession:
 
     def cache_metrics(self) -> dict[str, object]:
         metrics = self.fs.cache_metrics()
+        accounting = ManagedMemoryAccounting.from_session(
+            raw_cache_bytes=cast(int, metrics["cache_current_bytes"]),
+            decoded_index_objects=[self.index_data, self.manifest_data, self.bundle_manifest_data],
+            decoded_segment_objects=[],
+            resolved_aliases=dict(self.resolved_aliases),
+            event_buffer=list(self.fs.reads),
+            other_objects=[],
+            previous_peak=self.managed_total_peak_bytes,
+            max_bytes=self.max_memory_bytes,
+        )
+        self.managed_total_peak_bytes = accounting.managed_total_peak_bytes
         metrics.update(
             {
                 "resolved_alias_current_bytes": self.resolved_alias_bytes,
@@ -595,6 +615,7 @@ class TkncContextSession:
                 "resolved_alias_evictions": self.resolved_alias_evictions,
                 "managed_cache_peak_bytes": metrics["cache_peak_bytes"],
                 "membership_mode": self.index_data.get("membership", EXACT_MEMBERSHIP) if self.index_data else None,
+                **accounting.as_dict(),
             }
         )
         return metrics
@@ -628,3 +649,16 @@ class TkncContextSession:
     def _ensure_open(self) -> None:
         if self.closed:
             raise SidecarValidationError("TkncContextSession is closed")
+
+
+def _bundle_artifact_type(context_artifact_type: str) -> str | None:
+    return {
+        "alias_index": "alias_index",
+        "alias_segment": "alias_segment",
+        "sidecar": "alias_chunk",
+        "manifest": "source_manifest",
+        "bundle_manifest": None,
+        "search_index": "content_search_index",
+        "search_segment": "content_search_segment",
+        "content": "content_output",
+    }.get(context_artifact_type)

@@ -99,7 +99,7 @@ def apply_dictionary(text, dictionary, protected_manager):
     if not dictionary:
         return text
 
-    protected_text = protected_manager.protect(text)
+    protected_text = protected_manager.protect(text) if _needs_protection(text) else text
     sorted_dict = sorted(dictionary.items(), key=lambda x: len(x[0]), reverse=True)
     for word, alias in sorted_dict:
         pattern = re.compile(rf'\b{re.escape(word)}\b')

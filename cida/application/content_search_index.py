@@ -1,4 +1,5 @@
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any, Iterable
@@ -15,7 +16,30 @@ MAX_POSTINGS_PER_TERM = 2_000
 MAX_TERMS_PER_FILE = 2_000
 SINGLE_SEGMENT_FILE_LIMIT = 16
 SINGLE_SEGMENT_ID = "all"
-TERM_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+TERM_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{1,}")
+CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+STEM_SUFFIXES = (
+    "acoes",
+    "acao",
+    "oes",
+    "ing",
+    "tion",
+    "sion",
+    "ment",
+    "ments",
+    "adores",
+    "ador",
+    "antes",
+    "ante",
+    "arios",
+    "ario",
+    "ivas",
+    "ivos",
+    "iva",
+    "ivo",
+    "es",
+    "s",
+)
 ALPHA_SEGMENT_BUCKETS = (
     ("a", "f", "a-f"),
     ("g", "l", "g-l"),
@@ -32,13 +56,31 @@ class ContentSearchIndexArtifacts:
 
 
 def normalize_terms(text: str) -> tuple[str, ...]:
+    expanded_text = _identifier_words(text)
     terms = []
-    for raw in TERM_RE.findall(text):
+    for raw in TERM_RE.findall(expanded_text):
         term = raw.lower()
         if len(term) > 64:
             term = term[:64]
         terms.append(term)
+        stem = _simple_stem(term)
+        if stem != term:
+            terms.append(stem)
     return tuple(dict.fromkeys(terms))
+
+
+def _identifier_words(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text)
+    ascii_text = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    split = CAMEL_BOUNDARY_RE.sub(" ", ascii_text)
+    return split.replace("_", " ").replace("-", " ")
+
+
+def _simple_stem(term: str) -> str:
+    for suffix in STEM_SUFFIXES:
+        if term.endswith(suffix) and len(term) - len(suffix) >= 4:
+            return term[: -len(suffix)]
+    return term
 
 
 def segment_id_for_term(term: str) -> str:
@@ -63,12 +105,16 @@ def build_content_search_index_artifacts(
     json_codec: Any,
 ) -> ContentSearchIndexArtifacts:
     postings: dict[str, set[str]] = {}
+    term_cache: dict[str, tuple[str, ...]] = {}
     file_count = 0
     for rel_path, text in sorted(files):
         safe_path = _safe_content_path(rel_path)
         file_count += 1
         path_terms = normalize_terms(safe_path.replace("/", " "))
-        content_terms = normalize_terms(text)
+        content_terms = term_cache.get(text)
+        if content_terms is None:
+            content_terms = normalize_terms(text)
+            term_cache[text] = content_terms
         for term in tuple(dict.fromkeys((*path_terms, *content_terms)))[:MAX_TERMS_PER_FILE]:
             postings.setdefault(term, set()).add(safe_path)
 

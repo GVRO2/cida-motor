@@ -13,6 +13,10 @@ class GoDependencyViolation:
     reason: str
 
 
+def go_executable() -> str:
+    return os.environ.get("CIDA_GO_BIN") or "go"
+
+
 def parse_go_mod(source: str) -> tuple[str | None, list[GoDependencyViolation]]:
     module_name: str | None = None
     violations: list[GoDependencyViolation] = []
@@ -96,7 +100,7 @@ def go_list_module_violations(root: Path, main_module: str) -> list[str]:
     env.setdefault("GOCACHE", str(go_cache))
     env.setdefault("GOTMPDIR", str(go_tmp))
     result = subprocess.run(
-        ["go", "list", "-deps", "-f", "{{if not .Standard}}{{.ImportPath}}{{end}}", "./..."],
+        [go_executable(), "list", "-deps", "-f", "{{if not .Standard}}{{.ImportPath}}{{end}}", "./..."],
         cwd=root,
         env=env,
         text=True,

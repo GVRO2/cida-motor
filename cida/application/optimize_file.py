@@ -3,7 +3,7 @@ from collections import Counter
 from typing import Any, Callable
 from cida.application.ports import TokenCounter, FileRepository, HashService, JsonCodec
 from cida.markdown.protected_regions import ProtectedRegionsManager
-from cida.markdown.dictionary import generate_alias_candidates, find_candidate_words, apply_dictionary
+from cida.markdown.dictionary import _needs_protection, generate_alias_candidates, find_candidate_words, apply_dictionary
 from cida.domain.sidecar import create_sidecar_data
 
 
@@ -51,35 +51,58 @@ class FileOptimizerUsecase:
 
         return 'markdown'
 
-    def optimize_markdown_dictionary_file_scope(self, content: str, transformed_text: str, filepath: str, verify_semantics: bool, precomputed_source_sha256: str = "") -> tuple:
+    def optimize_markdown_dictionary_file_scope(
+        self,
+        content: str,
+        transformed_text: str,
+        filepath: str,
+        verify_semantics: bool,
+        precomputed_source_sha256: str = "",
+        precomputed_transformed_tokens: int | None = None,
+    ) -> tuple:
         content_bytes = content.encode('utf-8')
         source_sha256 = precomputed_source_sha256 if precomputed_source_sha256 else self.hash_service.sha256(content_bytes)
 
-        base_tokens = self.token_counter.count(transformed_text)
+        base_tokens = (
+            precomputed_transformed_tokens
+            if precomputed_transformed_tokens is not None
+            else self.token_counter.count(transformed_text)
+        )
         best_tokens = base_tokens
         best_minified = transformed_text
         best_sidecar_data = None
 
-        pm = ProtectedRegionsManager()
-        protected_text = pm.protect(transformed_text)
-
-        exclude_set = set(re.findall(r'\b\w+\b', transformed_text))
-        candidate_words = find_candidate_words(protected_text)
+        candidate_words = find_candidate_words(transformed_text)
         if not candidate_words:
             return transformed_text, None, 0
 
         word_counts = Counter(candidate_words)
-        sorted_words = sorted(word_counts.items(), key=lambda x: x[1] * len(x[0]), reverse=True)
+        if not any(freq >= 2 for freq in word_counts.values()):
+            return transformed_text, None, 0
 
-        aliases = generate_alias_candidates(exclude_set, limit=len(word_counts) + 10)
+        pm = ProtectedRegionsManager()
+        if _needs_protection(transformed_text):
+            protected_text = pm.protect(transformed_text)
+            candidate_words = find_candidate_words(protected_text)
+            if not candidate_words:
+                return transformed_text, None, 0
+            word_counts = Counter(candidate_words)
+
+        exclude_set = set(re.findall(r'\b\w+\b', transformed_text))
+        sorted_words = [
+            item for item in sorted(word_counts.items(), key=lambda x: x[1] * len(x[0]), reverse=True)
+            if item[1] >= 2
+        ]
+        if not sorted_words:
+            return transformed_text, None, 0
+
+        aliases = generate_alias_candidates(exclude_set, limit=len(sorted_words) + 10)
 
         current_dict = {}
         alias_idx = 0
 
         # First pass: collect words with individual token savings
         for word, freq in sorted_words:
-            if freq < 2:
-                continue
             if alias_idx >= len(aliases):
                 break
 

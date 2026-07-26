@@ -2,6 +2,7 @@ import re
 import string
 from dataclasses import dataclass
 from functools import cached_property
+from itertools import product
 from typing import Iterable
 
 
@@ -84,12 +85,12 @@ class AliasCodec:
 
     def iter_candidates(self, exclude_set: Iterable[str] = ()) -> Iterable[str]:
         excluded = set(exclude_set)
-        ordinal = 0
-        while True:
-            candidate = self.encode_ordinal(ordinal)
-            ordinal += 1
-            if candidate not in excluded:
-                yield candidate
+        for length in range(self.min_length, self.max_length + 1):
+            for _, alphabet in self._alphabets:
+                for chars in product(alphabet, repeat=length):
+                    candidate = "".join(chars)
+                    if candidate not in excluded:
+                        yield candidate
 
     def segment_id(self, alias: str) -> str:
         identity = self.decode_alias(alias)

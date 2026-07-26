@@ -23,6 +23,11 @@ from cida.infrastructure.json_codec import JsonCodec  # noqa: E402
 from cida.markdown.dictionary import CorpusDictionaryBuilder  # noqa: E402
 from cida.domain.errors import SidecarValidationError  # noqa: E402
 
+
+def _go_executable():
+    return os.environ.get("CIDA_GO_BIN") or "go"
+
+
 class TestPipelineIntegration(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.mkdtemp(prefix="cida-integration-")
@@ -58,7 +63,7 @@ class TestPipelineIntegration(unittest.TestCase):
     def test_integration_pipeline_run(self):
         # Run go program motor_v3.go
         cmd = [
-            "go", "run", "motor_v3.go",
+            _go_executable(), "run", "motor_v3.go",
             self.src_dir,
             self.dst_dir,
             "--mode", "semantic",

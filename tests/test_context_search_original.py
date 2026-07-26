@@ -9,4 +9,5 @@ def test_original_search_discovers_files_from_question_without_expected_file_inp
 
     assert "cida/application/optimize_corpus.py" in result.files
     assert result.files_scanned >= 8
-    assert "write_corpus_sidecars" in result.terms
+    assert "auxiliares" in result.terms or "auxiliar" in result.terms
+    assert "write_corpus_sidecars" not in result.terms

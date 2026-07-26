@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from cida.application.optimize_corpus import CorpusOptimizerUsecase
 from cida.application.selective_alias_resolution import ALIAS_INDEX_FILENAME, SelectiveAliasResolver
 from cida.infrastructure.filesystem import PhysicalFilesystem
@@ -5,6 +7,8 @@ from cida.infrastructure.hashing import HashService
 from cida.infrastructure.json_codec import JsonCodec
 from cida.infrastructure.tokenizer import OfflineTokenizer
 from cida.markdown.dictionary import generate_alias_candidates
+
+ROOT = Path(__file__).resolve().parent.parent
 
 
 class _UnusedDictionaryBuilder:
@@ -31,7 +35,12 @@ def test_real_generated_alias_membership_resolves_across_generator_transitions(t
     for alias_count in (676, 677, 1352, 1353, 2000, 5000, 10000):
         aliases, tknd = _write_real_alias_product_chunks(tmp_path / f"case-{alias_count}", alias_count)
         index = JsonCodec().decode((tknd / ALIAS_INDEX_FILENAME).read_text(encoding="utf-8"))
-        resolver = SelectiveAliasResolver(PhysicalFilesystem(), JsonCodec(), HashService(), OfflineTokenizer())
+        resolver = SelectiveAliasResolver(
+            PhysicalFilesystem(),
+            JsonCodec(),
+            HashService(),
+            OfflineTokenizer(cache_dir=str(ROOT / "resources")),
+        )
 
         resolved = resolver.resolve(set(aliases), str(tknd))
 

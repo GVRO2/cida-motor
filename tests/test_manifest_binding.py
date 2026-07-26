@@ -40,7 +40,7 @@ def test_session_rejects_tampered_manifest(tmp_path):
     search = session.search(_question_set()[-1].question, query_id="Q")
     aliases = session.aliases_in_index(set(search.alias_candidates), query_id="Q")
 
-    with pytest.raises(SidecarValidationError, match="manifest hash mismatch"):
+    with pytest.raises(SidecarValidationError, match=r"(manifest hash mismatch|Bundle artifact (hash|size) mismatch)"):
         session.resolve(aliases, query_id="Q")
 
 

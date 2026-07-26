@@ -16,7 +16,6 @@ from cida.infrastructure.hashing import HashService
 from cida.infrastructure.json_codec import JsonCodec
 from cida.application.optimize_file import FileOptimizerUsecase
 from cida.application.optimize_corpus import CorpusOptimizerUsecase
-from cida.application.selective_alias_resolution import SelectiveAliasResolver
 from cida.application.generate_report import ReportGeneratorUsecase
 from cida.domain.processing_context import ProcessingContext
 from cida.markdown.protected_regions import ProtectedRegionsManager
@@ -224,29 +223,26 @@ def _write_content_search_index(
     json_codec: JsonCodec,
     hash_service: HashService,
     corpus_hash: str,
+    artifact_sizes: dict[str, int] | None = None,
 ) -> dict[str, str]:
-    if not generated_bundles:
+    if not generated_bundles or not corpus_hash:
         return {}
     from cida.application.content_search_index import SEARCH_INDEX_FILENAME, build_content_search_index_artifacts
 
     indexed_files: list[tuple[str, str]] = []
-    output_hashes: dict[str, str] = {}
-    for _, dest_path, _, _, out_bytes in generated_bundles:
+    artifact_hashes: dict[str, str] = {}
+    for _, dest_path, _, source_bytes, _ in generated_bundles:
         rel_path = file_repo.relpath(dest_path, dst_abs).replace("\\", "/")
         try:
-            text = out_bytes.decode("utf-8")
+            source_text = source_bytes.decode("utf-8")
         except UnicodeDecodeError:
             continue
-        indexed_files.append((rel_path, text))
-        output_hashes[rel_path] = hash_service.sha256(out_bytes)
+        indexed_files.append((rel_path, source_text))
     if not indexed_files:
-        return output_hashes
-    if len(indexed_files) == 1 and not corpus_hash:
-        return output_hashes
-    corpus_id = corpus_hash or hash_service.sha256(json_codec.canonical_encode(output_hashes).encode("utf-8"))
+        return artifact_hashes
     artifacts = build_content_search_index_artifacts(
         indexed_files,
-        corpus_id=corpus_id,
+        corpus_id=corpus_hash,
         hash_service=hash_service,
         json_codec=json_codec,
     )
@@ -254,13 +250,21 @@ def _write_content_search_index(
     file_repo.makedirs(tknd_dir)
     for segment_path, segment_data in sorted(artifacts.segments.items()):
         full_segment_path = file_repo.join(tknd_dir, *segment_path.split("/"))
-        segment_text = json_codec.encode(segment_data, indent=4)
-        file_repo.write_text(full_segment_path, segment_text)
-        output_hashes[f"tknd/{segment_path}"] = hash_service.sha256(segment_text.encode("utf-8"))
-    root_text = json_codec.encode(artifacts.root, indent=4)
-    file_repo.write_text(file_repo.join(tknd_dir, SEARCH_INDEX_FILENAME), root_text)
-    output_hashes[f"tknd/{SEARCH_INDEX_FILENAME}"] = hash_service.sha256(root_text.encode("utf-8"))
-    return output_hashes
+        segment_text = json_codec.canonical_encode(segment_data)
+        segment_bytes = segment_text.encode("utf-8")
+        file_repo.write_bytes(full_segment_path, segment_bytes)
+        rel_segment = f"tknd/{segment_path}"
+        artifact_hashes[rel_segment] = hash_service.sha256(segment_bytes)
+        if artifact_sizes is not None:
+            artifact_sizes[rel_segment] = len(segment_bytes)
+    root_text = json_codec.canonical_encode(artifacts.root)
+    root_bytes = root_text.encode("utf-8")
+    file_repo.write_bytes(file_repo.join(tknd_dir, SEARCH_INDEX_FILENAME), root_bytes)
+    rel_root = f"tknd/{SEARCH_INDEX_FILENAME}"
+    artifact_hashes[rel_root] = hash_service.sha256(root_bytes)
+    if artifact_sizes is not None:
+        artifact_sizes[rel_root] = len(root_bytes)
+    return artifact_hashes
 
 
 def _write_bundle_manifest(
@@ -270,6 +274,7 @@ def _write_bundle_manifest(
     hash_service: HashService,
     source_manifest_sha256: str,
     precomputed_hashes: dict[str, str] | None = None,
+    precomputed_sizes: dict[str, int] | None = None,
 ) -> None:
     from cida.application.bundle_manifest import BUNDLE_MANIFEST_FILENAME, build_bundle_manifest
 
@@ -280,10 +285,22 @@ def _write_bundle_manifest(
         json_codec=json_codec,
         source_manifest_sha256=source_manifest_sha256,
         precomputed_hashes=precomputed_hashes,
+        precomputed_sizes=precomputed_sizes,
+        artifact_paths=set(precomputed_hashes) if precomputed_hashes else None,
     )
     tknd_dir = file_repo.join(dst_abs, "tknd")
     file_repo.makedirs(tknd_dir)
-    file_repo.write_text(file_repo.join(tknd_dir, BUNDLE_MANIFEST_FILENAME), json_codec.encode(manifest, indent=4))
+    manifest_bytes = json_codec.canonical_encode(manifest).encode("utf-8")
+    file_repo.write_bytes(file_repo.join(tknd_dir, BUNDLE_MANIFEST_FILENAME), manifest_bytes)
+
+
+def _has_lookup_artifacts(artifact_hashes: dict[str, str]) -> bool:
+    return any(
+        rel == "tknc-manifest.json"
+        or rel.endswith(".cidatkn")
+        or rel.startswith("tknd/")
+        for rel in artifact_hashes
+    )
 
 
 def counter_main():
@@ -365,6 +382,8 @@ def translate_main():
                 sys.exit(5)
 
             try:
+                from cida.application.selective_alias_resolution import SelectiveAliasResolver
+
                 resolver = SelectiveAliasResolver(file_repo, json_codec, hash_service)
                 resolution = resolver.resolve(set(tokens_to_translate), sidecar_dir)
                 mapping = resolution.resolved
@@ -429,7 +448,7 @@ def main():
         validate_mode_profile_combination(args.mode, args.profile, args.dictionary_scope)
 
 
-        file_repo = PhysicalFilesystem(durable=args.durable_writes)
+        file_repo = PhysicalFilesystem(durable=args.durable_writes, atomic=args.durable_writes)
         token_counter = OfflineTokenizer(enable_cache=not args.no_cache)
         hash_service = HashService()
         json_codec = JsonCodec()
@@ -445,6 +464,7 @@ def main():
         java_raw_metrics = []
         generated_bundles = []
         artifact_hashes: dict[str, str] = {}
+        artifact_sizes: dict[str, int] = {}
 
         java_processed_relpaths = set()
         if args.java_raw_json and file_repo.exists(args.java_raw_json):
@@ -482,12 +502,30 @@ def main():
         if args.profile == "auto" or args.dictionary_scope == "file":
             file_opt = FileOptimizerUsecase(token_counter, file_repo, hash_service, json_codec)
         semantic_dependencies: tuple[type[Any], Any] | None = None
+        semantic_validation_cache: dict[tuple[str, str, tuple[tuple[str, str], ...]], tuple[bool, str]] = {}
 
         def ensure_semantic_dependencies() -> tuple[type[Any], Any]:
             nonlocal semantic_dependencies
             if semantic_dependencies is None:
                 semantic_dependencies = _load_semantic_dependencies()
             return semantic_dependencies
+
+        def validate_semantics_cached(
+            original_text: str,
+            candidate_text: str,
+            validation_dict: dict[str, str] | None = None,
+            parsed_original: Any | None = None,
+        ) -> tuple[bool, str]:
+            ParsedOriginalDocument, validate_semantics = ensure_semantic_dependencies()
+            mapping = tuple(sorted((validation_dict or {}).items()))
+            key = (original_text, candidate_text, mapping)
+            cached = semantic_validation_cache.get(key)
+            if cached is not None:
+                return cached
+            parsed = parsed_original if parsed_original is not None else ParsedOriginalDocument(original_text)
+            result = validate_semantics(original_text, candidate_text, validation_dict, parsed_original=parsed)
+            semantic_validation_cache[key] = result
+            return result
 
         dictionary_builder = None
         if args.dictionary_scope == "corpus":
@@ -539,15 +577,31 @@ def main():
 
         if args.dictionary_scope == "corpus":
             from cida.markdown.dictionary import apply_dictionary
-            corpus_dict, corpus_hash, sidecar_tokens_total, auxiliary_tokens = corpus_opt.build_corpus_dict(
-                files_to_process,
-                src_abs,
-                skip_binary_check=True,
-            )
-
-            if corpus_dict:
-                total_orig_tokens = 0
-                total_mini_tokens = 0
+            if len(files_to_process) <= 10:
+                corpus_dict, corpus_hash, sidecar_tokens_total, auxiliary_tokens = corpus_opt.build_corpus_dict(
+                    files_to_process,
+                    src_abs,
+                    skip_binary_check=True,
+                )
+                if corpus_dict:
+                    content_cache, context_failures, python_context_parallel_enabled = _build_processing_contexts(
+                        files_to_process,
+                        src_abs,
+                        args.profile,
+                        args.workers,
+                        not args.no_cache,
+                        file_repo,
+                        file_opt,
+                        hash_service,
+                        token_counter,
+                    )
+                    for fp in files_to_process:
+                        if fp in context_failures:
+                            exc = context_failures[fp]
+                            raise SourcePathError(
+                                f"Failed to read corpus source for token estimation '{fp}': {exc}"
+                            ) from exc
+            else:
                 content_cache, context_failures, python_context_parallel_enabled = _build_processing_contexts(
                     files_to_process,
                     src_abs,
@@ -565,6 +619,14 @@ def main():
                         raise SourcePathError(
                             f"Failed to read corpus source for token estimation '{fp}': {exc}"
                         ) from exc
+                corpus_dict, corpus_hash, sidecar_tokens_total, auxiliary_tokens = corpus_opt.build_corpus_dict_from_contexts(
+                    [content_cache[fp] for fp in files_to_process if fp in content_cache]
+                )
+
+            if corpus_dict:
+                total_orig_tokens = 0
+                total_mini_tokens = 0
+                for fp in files_to_process:
                     ctx = content_cache[fp]
                     c = ctx.source_text
                     total_orig_tokens += ctx.original_tokens
@@ -583,9 +645,7 @@ def main():
                         pm = ProtectedRegionsManager()
                         cand = apply_dictionary(curr, corpus_dict, pm)
                         if cand != curr and args.verify_semantics:
-                            ParsedOriginalDocument, validate_semantics = ensure_semantic_dependencies()
-                            parsed_c = ParsedOriginalDocument(c)
-                            is_valid, _ = validate_semantics(c, cand, corpus_dict, parsed_original=parsed_c)
+                            is_valid, _ = validate_semantics_cached(c, cand, corpus_dict)
                             cand_tokens = token_counter.count(cand)
                             if is_valid and cand_tokens < curr_tokens:
                                 curr = cand
@@ -602,7 +662,7 @@ def main():
                         corpus_hash = ""
                     else:
                         if not args.dry_run:
-                            artifact_hashes.update(corpus_opt.write_corpus_sidecars(corpus_dict, corpus_hash, dst_abs))
+                            artifact_hashes.update(corpus_opt.write_corpus_sidecars(corpus_dict, corpus_hash, dst_abs, artifact_sizes))
                 else:
                     corpus_dict = {}
                     corpus_hash = ""
@@ -737,10 +797,10 @@ def main():
                         continue
 
                     if args.verify_semantics:
-                        ParsedOriginalDocument, validate_semantics = ensure_semantic_dependencies()
                         if parsed_orig is None:
+                            ParsedOriginalDocument, _ = ensure_semantic_dependencies()
                             parsed_orig = ParsedOriginalDocument(content)
-                        is_valid, _ = validate_semantics(content, candidate_text, parsed_original=parsed_orig)
+                        is_valid, _ = validate_semantics_cached(content, candidate_text, parsed_original=parsed_orig)
                         if not is_valid:
                             rejected_transforms.append(f"{name}_semantic_fail")
                             continue
@@ -752,11 +812,16 @@ def main():
 
                 if args.dictionary_scope == "file":
                     candidate_text, sidecar_data, dict_tokens = file_opt.optimize_markdown_dictionary_file_scope(
-                        content, current_text, ctx.relative_path, args.verify_semantics, precomputed_source_sha256=content_sha
+                        content,
+                        current_text,
+                        ctx.relative_path,
+                        args.verify_semantics,
+                        precomputed_source_sha256=content_sha,
+                        precomputed_transformed_tokens=current_tokens,
                     )
                     if sidecar_data:
                         cand_tokens = token_counter.count(candidate_text)
-                        cand_sidecar_tokens = token_counter.count(json_codec.encode(sidecar_data, indent=4))
+                        cand_sidecar_tokens = token_counter.count(json_codec.canonical_encode(sidecar_data))
                         cand_aux_tokens = 0
 
                         economia_bruta = orig_tokens - cand_tokens
@@ -780,10 +845,10 @@ def main():
                     candidate_text = apply_dictionary(current_text, corpus_dict, pm)
 
                     if args.verify_semantics:
-                        ParsedOriginalDocument, validate_semantics = ensure_semantic_dependencies()
                         if parsed_orig is None:
+                            ParsedOriginalDocument, _ = ensure_semantic_dependencies()
                             parsed_orig = ParsedOriginalDocument(content)
-                        is_valid, _ = validate_semantics(content, candidate_text, corpus_dict, parsed_original=parsed_orig)
+                        is_valid, _ = validate_semantics_cached(content, candidate_text, corpus_dict, parsed_original=parsed_orig)
                         if is_valid:
                             cand_tokens = token_counter.count(candidate_text)
                             if cand_tokens < current_tokens:
@@ -852,8 +917,8 @@ def main():
                 and not final_semantics_validated
                 and (final_text != content or _requires_identity_semantic_validation(content))
             ):
-                ParsedOriginalDocument, validate_semantics = ensure_semantic_dependencies()
                 if parsed_orig is None:
+                    ParsedOriginalDocument, _ = ensure_semantic_dependencies()
                     parsed_orig = ParsedOriginalDocument(content)
                 validation_dict = {}
                 if dict_included:
@@ -862,7 +927,7 @@ def main():
                     elif corpus_dict:
                         validation_dict = corpus_dict
                 try:
-                    is_valid, msg = validate_semantics(content, final_text, validation_dict, parsed_original=parsed_orig)
+                    is_valid, msg = validate_semantics_cached(content, final_text, validation_dict, parsed_original=parsed_orig)
                 except Exception as ve:
                     is_valid = False
                     msg = str(ve)
@@ -892,11 +957,17 @@ def main():
             if not args.dry_run:
                 out_bytes = text_to_write.encode('utf-8')
                 file_repo.write_bytes(dest_path, out_bytes)
-                artifact_hashes[file_repo.relpath(dest_path, dst_abs).replace("\\", "/")] = hash_service.sha256(out_bytes)
+                if sidecar_path or corpus_hash:
+                    rel_output = file_repo.relpath(dest_path, dst_abs).replace("\\", "/")
+                    artifact_hashes[rel_output] = hash_service.sha256(out_bytes)
+                    artifact_sizes[rel_output] = len(out_bytes)
                 if sidecar_path:
-                    sidecar_text = json_codec.encode(best_sidecar_data, indent=4)
-                    file_repo.write_text(sidecar_path, sidecar_text)
-                    artifact_hashes[file_repo.relpath(sidecar_path, dst_abs).replace("\\", "/")] = hash_service.sha256(sidecar_text.encode("utf-8"))
+                    sidecar_text = json_codec.canonical_encode(best_sidecar_data)
+                    sidecar_bytes = sidecar_text.encode("utf-8")
+                    file_repo.write_bytes(sidecar_path, sidecar_bytes)
+                    rel_sidecar = file_repo.relpath(sidecar_path, dst_abs).replace("\\", "/")
+                    artifact_hashes[rel_sidecar] = hash_service.sha256(sidecar_bytes)
+                    artifact_sizes[rel_sidecar] = len(sidecar_bytes)
                 generated_bundles.append((filepath, dest_path, sidecar_path, content_bytes, out_bytes))
 
             final_written_tokens = final_tokens if text_to_write == final_text else token_counter.count(text_to_write)
@@ -920,9 +991,10 @@ def main():
             )
 
         if not args.dry_run:
-            artifact_hashes.update(_write_content_search_index(dst_abs, generated_bundles, file_repo, json_codec, hash_service, corpus_hash))
-            source_manifest_sha256 = corpus_hash or hash_service.sha256(b"no-source-manifest")
-            _write_bundle_manifest(dst_abs, file_repo, json_codec, hash_service, source_manifest_sha256, artifact_hashes)
+            artifact_hashes.update(_write_content_search_index(dst_abs, generated_bundles, file_repo, json_codec, hash_service, corpus_hash, artifact_sizes))
+            if _has_lookup_artifacts(artifact_hashes):
+                source_manifest_sha256 = corpus_hash or hash_service.sha256(b"no-source-manifest")
+                _write_bundle_manifest(dst_abs, file_repo, json_codec, hash_service, source_manifest_sha256, artifact_hashes, artifact_sizes)
 
         report_name = args.report_path
         if not args.dry_run and args.report in ["text", "both", "json"]:
@@ -941,8 +1013,15 @@ def main():
             strict_auditor = StrictBundleAuditor(file_repo, json_codec, hash_service)
             strict_auditor.audit_destination_sidecars(src_abs, dst_abs)
             for item in generated_bundles:
-                _, out_f, side_f = item[0], item[1], item[2]
-                strict_auditor.audit_output_bundle(src_abs, dst_abs, out_f, side_f)
+                _, out_f, side_f, source_bytes, out_bytes = item
+                strict_auditor.audit_output_bundle(
+                    src_abs,
+                    dst_abs,
+                    out_f,
+                    side_f,
+                    preloaded_source_bytes=source_bytes,
+                    preloaded_output_bytes=out_bytes,
+                )
 
 
         if aggregator.records:

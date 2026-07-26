@@ -5,8 +5,8 @@ import sys
 from pathlib import Path
 
 
-def test_context_report_v4_separates_model_context_from_local_retrieval(tmp_path):
-    output_json = tmp_path / "context-usage-report-v4.json"
+def test_context_report_v5_separates_model_context_from_local_retrieval(tmp_path):
+    output_json = tmp_path / "context-usage-report-v5.json"
     env = os.environ.copy()
     env["TIKTOKEN_CACHE_DIR"] = str(Path(__file__).resolve().parent.parent / "resources")
 
@@ -17,7 +17,7 @@ def test_context_report_v4_separates_model_context_from_local_retrieval(tmp_path
             "--output-json",
             str(output_json),
             "--output-markdown",
-            str(tmp_path / "context-usage-report-v4.md"),
+            str(tmp_path / "context-usage-report-v5.md"),
         ],
         cwd=str(Path(__file__).resolve().parent.parent),
         env=env,
@@ -32,7 +32,7 @@ def test_context_report_v4_separates_model_context_from_local_retrieval(tmp_path
     report = json.loads(output_json.read_text(encoding="utf-8"))
     first = report["scenarios"][0]["tknc"]
 
-    assert report["schema_version"] == 4
+    assert report["schema_version"] == 5
     assert "tokens_loaded_once" not in json.dumps(report)
     assert "model_total_context_tokens" in first["model_context"]
     assert "search_index_bytes" in first["local_retrieval"]

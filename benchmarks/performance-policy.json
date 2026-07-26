@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "median_budget": 0.05,
+  "p95_budget": 0.10,
+  "rss_budget": 0.10,
+  "stability_cv_limit": 0.10,
+  "balanced_runs": 5,
+  "balanced_warmups": 1,
+  "allow_timing_skip": false,
+  "allow_parent_only_rss": false,
+  "allow_system_site_packages": false
+}

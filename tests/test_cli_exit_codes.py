@@ -6,6 +6,11 @@ import tempfile
 import shutil
 import time
 
+
+def _go_executable():
+    return os.environ.get("CIDA_GO_BIN") or "go"
+
+
 class TestCLIExitCodes(unittest.TestCase):
     def setUp(self):
         dir_path = os.path.dirname(os.path.abspath(__file__))
@@ -32,7 +37,7 @@ class TestCLIExitCodes(unittest.TestCase):
         last_result = None
         for attempt in range(3):
             last_result = subprocess.run(
-                ["go", "build", "-o", self.go_cli, "motor_v3.go"],
+                [_go_executable(), "build", "-o", self.go_cli, "motor_v3.go"],
                 cwd=self.project_root,
                 env=env,
                 stdout=subprocess.PIPE,

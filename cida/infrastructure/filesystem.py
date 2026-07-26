@@ -8,8 +8,9 @@ from cida.domain.errors import SidecarValidationError
 class PhysicalFilesystem:
     """Concrete implementation of filesystem repository."""
 
-    def __init__(self, durable: bool = False):
+    def __init__(self, durable: bool = False, atomic: bool = True):
         self.durable = durable
+        self.atomic = atomic
         self._created_dirs: set[str] = set()
 
     def read_text(self, filepath: str, encoding: str = "utf-8") -> str:
@@ -44,6 +45,10 @@ class PhysicalFilesystem:
             os.makedirs(dir_name, exist_ok=True)
             self._created_dirs.add(dir_name)
         content_lf = content.replace('\r\n', '\n')
+        if not (durable or self.durable or self.atomic):
+            with open(abs_path, 'w', encoding=encoding, newline='\n') as f:
+                f.write(content_lf)
+            return
         fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix=".tmp-")
         try:
             with os.fdopen(fd, 'w', encoding=encoding, newline='\n') as f:
@@ -65,6 +70,10 @@ class PhysicalFilesystem:
         if dir_name not in self._created_dirs:
             os.makedirs(dir_name, exist_ok=True)
             self._created_dirs.add(dir_name)
+        if not (durable or self.durable or self.atomic):
+            with open(abs_path, 'wb') as f:
+                f.write(content)
+            return
         fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix=".tmp-")
         try:
             with os.fdopen(fd, 'wb') as f:

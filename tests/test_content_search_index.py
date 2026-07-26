@@ -1,4 +1,5 @@
 import pytest
+from pathlib import Path
 
 from cida.application.content_search_index import (
     SEARCH_INDEX_FILENAME,
@@ -13,6 +14,8 @@ from cida.infrastructure.hashing import HashService
 from cida.infrastructure.json_codec import JsonCodec
 from cida.infrastructure.tknc_context_session import ContextFilesystem, search_context
 from cida.infrastructure.tokenizer import OfflineTokenizer
+
+ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_content_search_index_loads_only_term_segments_and_candidates(tmp_path):
@@ -37,7 +40,7 @@ def test_content_search_index_loads_only_term_segments_and_candidates(tmp_path):
         path.write_text(text, encoding="utf-8")
 
     fs = ContextFilesystem()
-    result = search_context(tmp_path, "needle_symbol", fs, OfflineTokenizer(), query_id="indexed")
+    result = search_context(tmp_path, "needle_symbol", fs, OfflineTokenizer(cache_dir=str(ROOT / "resources")), query_id="indexed")
 
     assert result.search_mode == "INDEXED"
     assert result.files == ("a.py.tknc", "docs/readme.md")

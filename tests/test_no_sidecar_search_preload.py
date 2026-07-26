@@ -31,5 +31,5 @@ def test_no_sidecar_or_index_is_read_during_initial_tknc_search(tmp_path):
     assert search.files
     assert search.search_mode == "INDEXED"
     assert search.search_index_segments_loaded > 0
-    assert all(event.artifact_type in {"content", "search_index"} for event in fs.reads)
+    assert all(event.artifact_type in {"content", "search_index", "search_segment"} for event in fs.reads)
     assert not any(event.artifact_type in {"sidecar", "alias_index", "manifest"} for event in fs.reads)

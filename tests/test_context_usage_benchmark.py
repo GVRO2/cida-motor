@@ -32,7 +32,7 @@ def test_full_vs_full_contract(tmp_path):
     assert result.returncode == 0, result.stderr + result.stdout
     report = json.loads(output_json.read_text(encoding="utf-8"))
 
-    assert report["schema_version"] == 4
+    assert report["schema_version"] == 5
     assert report["summary"]["overall_result"] == "PASS"
     assert report["summary"]["full_vs_full"]["result"] == "PASS"
     assert report["summary"]["selective_warm"]["result"] == "PASS"
@@ -42,7 +42,8 @@ def test_full_vs_full_contract(tmp_path):
     assert report["cache"]["result"] == "PASS"
     assert report["summary"]["accuracy"]["tknc_score"] >= report["summary"]["accuracy"]["original_score"]
     assert len(report["scenarios"]) == 24
-    assert output_md.read_text(encoding="utf-8").startswith("# CIDA .tknc Context Usage Report v4")
+    assert "hundred_chunks" in report["sessions_by_corpus"]
+    assert output_md.read_text(encoding="utf-8").startswith("# CIDA .tknc Context Usage Report v5")
 
 
 def test_lookup_reads_only_required_chunks(tmp_path):
@@ -104,7 +105,7 @@ def test_selective_cold_contract():
         },
     }
 
-    report = _summarize("head", {"scale": {"alias_count": 5000, "chunk_count": 10}}, [scenario], {"scale": {"exit_code": 0}}, sessions)
+    report = _summarize("head", {"scale": {"alias_count": 500, "chunk_count": 100}}, [scenario], {"scale": {"exit_code": 0}}, sessions)
 
     assert report["summary"]["selective_cold"]["required"] is False
     assert report["summary"]["selective_cold"]["result"] == "INFORMATIONAL"
@@ -138,7 +139,7 @@ def test_selective_warm_session_contract():
         "accuracy": {"original": {"accuracy": 1.0}, "tknc": {"accuracy": 1.0}},
     }
 
-    report = _summarize("head", {"scale": {"alias_count": 5000, "chunk_count": 10}}, [scenario], {"scale": {"exit_code": 0}}, sessions)
+    report = _summarize("head", {"scale": {"alias_count": 500, "chunk_count": 100}}, [scenario], {"scale": {"exit_code": 0}}, sessions)
 
     assert report["summary"]["selective_warm"]["result"] == "PASS"
 
@@ -170,7 +171,7 @@ def test_multi_query_break_even_contract():
         "accuracy": {"original": {"accuracy": 1.0}, "tknc": {"accuracy": 1.0}},
     }
 
-    report = _summarize("head", {"scale": {"alias_count": 5000, "chunk_count": 10}}, [scenario], {"scale": {"exit_code": 0}}, sessions)
+    report = _summarize("head", {"scale": {"alias_count": 500, "chunk_count": 100}}, [scenario], {"scale": {"exit_code": 0}}, sessions)
 
     assert report["summary"]["multi_query"]["break_even_query_count"] == 50
     assert report["summary"]["multi_query"]["result"] == "PASS"

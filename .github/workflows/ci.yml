@@ -141,7 +141,7 @@ jobs:
       run: python -m pytest tests/test_sidecar_path_security.py -q -v
 
   bundle-integrity:
-    name: Bundle Integrity on ${{ matrix.os }}
+    name: Bundle Runtime Integrity on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     needs: test
@@ -162,7 +162,81 @@ jobs:
       run: python -m pip install -r requirements-ci.txt
 
     - name: Run bundle integrity tests
-      run: python -m pytest tests/test_sidecar_validation_errors.py tests/test_sidecar_envelope_e2e.py tests/test_sidecar.py -q
+      run: python -m pytest tests/test_sidecar_validation_errors.py tests/test_sidecar_envelope_e2e.py tests/test_sidecar.py tests/test_bundle_runtime_integrity.py -q
+
+  harness-self-test:
+    name: Harness Self-Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    needs: test
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Python dependencies
+      run: python -m pip install -r requirements-ci.txt
+
+    - name: Run harness self-tests
+      run: python -m pytest tests/test_harness_self_test.py -q
+
+    - name: Runtime Harness Recursive Audit
+      run: python scripts/check_runtime_harness_references.py
+
+    - name: Benchmark Policy Audit
+      run: python scripts/audit_benchmark_policy.py
+
+  harness-original-project-inspection:
+    name: Harness Original Project Inspection on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    needs: harness-self-test
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Add upstream remote
+      shell: bash
+      run: |
+        if git remote get-url upstream >/dev/null 2>&1; then
+          git remote set-url upstream https://github.com/kaueMarques/cida-motor.git
+        else
+          git remote add upstream https://github.com/kaueMarques/cida-motor.git
+        fi
+
+    - name: Fetch upstream main
+      run: git fetch upstream main
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Python dependencies
+      run: python -m pip install -r requirements-ci.txt
+
+    - name: Inspect original and HEAD graphs
+      run: python scripts/inspect_original_project_harness.py --base-ref upstream/main --runner go --output original-project-harness-${{ matrix.os }}.json
+
+    - name: Upload original inspection artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: original-project-harness-${{ matrix.os }}
+        path: original-project-harness-${{ matrix.os }}.json
 
   go-lossless-auto-contract:
     name: Go Lossless/Auto Contract on ${{ matrix.os }}
@@ -201,7 +275,7 @@ jobs:
         fi
 
   benchmark:
-    name: Benchmark on ${{ matrix.os }}
+    name: Performance Producer on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     needs: test
@@ -247,17 +321,60 @@ jobs:
         name: manifest-${{ matrix.os }}
         path: manifest-${{ matrix.os }}.json
 
-    - name: Upload Performance Artifact
+    - name: Upload Balanced Performance Artifact
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: performance-${{ matrix.os }}
-        path: |
-          performance-balanced-${{ matrix.os }}.json
-          performance-strict-${{ matrix.os }}.json
+        name: performance-balanced-${{ matrix.os }}
+        path: performance-balanced-${{ matrix.os }}.json
+
+    - name: Upload Strict Performance Artifact
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: performance-strict-${{ matrix.os }}
+        path: performance-strict-${{ matrix.os }}.json
+
+  performance-independent-verification:
+    name: Performance Independent Verification on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    needs: benchmark
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Python dependencies
+      run: python -m pip install -r requirements-ci.txt
+
+    - name: Download balanced report
+      uses: actions/download-artifact@v4
+      with:
+        name: performance-balanced-${{ matrix.os }}
+        path: performance-balanced
+
+    - name: Download strict report
+      uses: actions/download-artifact@v4
+      with:
+        name: performance-strict-${{ matrix.os }}
+        path: performance-strict
+
+    - name: Verify performance reports independently
+      run: |
+        python scripts/verify_performance_report_v2.py performance-balanced/performance-balanced-${{ matrix.os }}.json
+        python scripts/verify_performance_report_v2.py performance-strict/performance-strict-${{ matrix.os }}.json
 
   tknc-context-efficiency:
-    name: TKNC Context Efficiency on ${{ matrix.os }}
+    name: Context Producer on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     needs: test
@@ -303,6 +420,9 @@ jobs:
     - name: Real Search Benchmark
       run: python -m pytest tests/test_context_search_original.py tests/test_context_search_tknc.py -q
 
+    - name: Generic Search Holdout
+      run: python -m pytest tests/test_generic_search_holdout.py -q
+
     - name: Accuracy Validation
       run: python -m pytest tests/test_context_accuracy.py -q
 
@@ -328,21 +448,151 @@ jobs:
       run: python scripts/check_runtime_harness_references.py
 
     - name: Generate Context Artifacts
-      run: python benchmarks/context_usage_compare.py --output-json context-usage-report-v4-${{ matrix.os }}.json --output-markdown context-usage-report-v4-${{ matrix.os }}.md --read-events-json context-read-events-v4-${{ matrix.os }}.json --cache-events-json context-cache-events-v4-${{ matrix.os }}.json --harness-events-json context-harness-events-v4-${{ matrix.os }}.json --source-manifest-json source-manifest-v2-${{ matrix.os }}.json --bundle-manifest-json bundle-manifest-v2-${{ matrix.os }}.json
+      run: python benchmarks/context_usage_compare.py --output-json context-v5-${{ matrix.os }}.json --output-markdown context-v5-${{ matrix.os }}.md --read-events-json context-read-events-v5-${{ matrix.os }}.json --cache-events-json context-cache-events-v5-${{ matrix.os }}.json --harness-events-json harness-v2-${{ matrix.os }}.json --source-manifest-json source-manifest-v2-${{ matrix.os }}.json --bundle-manifest-json bundle-manifest-v2-${{ matrix.os }}.json
 
-    - name: Artifact Upload
+    - name: Upload Context Artifact
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: context-usage-report-v4-${{ matrix.os }}
+        name: context-v5-${{ matrix.os }}
         path: |
-          context-usage-report-v4-${{ matrix.os }}.json
-          context-usage-report-v4-${{ matrix.os }}.md
-          context-read-events-v4-${{ matrix.os }}.json
-          context-cache-events-v4-${{ matrix.os }}.json
-          context-harness-events-v4-${{ matrix.os }}.json
+          context-v5-${{ matrix.os }}.json
+          context-v5-${{ matrix.os }}.md
+          context-read-events-v5-${{ matrix.os }}.json
+          context-cache-events-v5-${{ matrix.os }}.json
           source-manifest-v2-${{ matrix.os }}.json
           bundle-manifest-v2-${{ matrix.os }}.json
+
+    - name: Upload Harness Events Artifact
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: harness-v2-${{ matrix.os }}
+        path: harness-v2-${{ matrix.os }}.json
+
+    - name: Upload Warm Multi-Chunk Artifact
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: warm-multichunk-${{ matrix.os }}
+        path: context-v5-${{ matrix.os }}.json
+
+  context-independent-verification:
+    name: Context Independent Verification on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    needs: tknc-context-efficiency
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Python dependencies
+      run: python -m pip install -r requirements-ci.txt
+
+    - name: Download context report
+      uses: actions/download-artifact@v4
+      with:
+        name: context-v5-${{ matrix.os }}
+        path: context-v5
+
+    - name: Download harness events
+      uses: actions/download-artifact@v4
+      with:
+        name: harness-v2-${{ matrix.os }}
+        path: harness-v2
+
+    - name: Verify context report independently
+      run: python scripts/verify_context_report_v5.py context-v5/context-v5-${{ matrix.os }}.json
+
+    - name: Verify harness events independently
+      run: python scripts/verify_harness_events_v2.py harness-v2/harness-v2-${{ matrix.os }}.json
+
+  process-tree-rss:
+    name: Process-Tree RSS on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    needs: harness-self-test
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Python dependencies
+      run: python -m pip install -r requirements-ci.txt
+
+    - name: Run process-tree RSS tests
+      run: python -m pytest tests/test_process_tree_rss.py -q
+
+  generic-search-holdout:
+    name: Generic Search Holdout on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    needs: test
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Python dependencies
+      run: python -m pip install -r requirements-ci.txt
+
+    - name: Run generic search holdout
+      run: python -m pytest tests/test_generic_search_holdout.py -q
+
+  multi-chunk-warm-session:
+    name: Multi-Chunk Warm Session on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    needs: tknc-context-efficiency
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Python dependencies
+      run: python -m pip install -r requirements-ci.txt
+
+    - name: Download warm multi-chunk report
+      uses: actions/download-artifact@v4
+      with:
+        name: warm-multichunk-${{ matrix.os }}
+        path: warm-multichunk
+
+    - name: Verify warm multi-chunk report
+      run: python scripts/verify_context_report_v5.py warm-multichunk/context-v5-${{ matrix.os }}.json
 
   compare:
     name: Compare Manifests

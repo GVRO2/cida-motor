@@ -1,11 +1,22 @@
 import pytest
+import os
 import sys
 import subprocess
+from pathlib import Path
 from cida.infrastructure.filesystem import PhysicalFilesystem
 from cida.infrastructure.json_codec import JsonCodec
 from cida.infrastructure.hashing import HashService
 from cida.application.decompress_file import FileDecompressorUsecase
 from cida.domain.errors import SidecarValidationError
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _env():
+    env = os.environ.copy()
+    env["TIKTOKEN_CACHE_DIR"] = str(REPO_ROOT / "resources")
+    return env
 
 def test_sidecar_envelope_e2e_roundtrip(tmp_path):
     repo = PhysicalFilesystem()
@@ -27,7 +38,7 @@ def test_sidecar_envelope_e2e_roundtrip(tmp_path):
         "--profile", "markdown",
         "--dictionary-scope", "file"
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    res = subprocess.run(cmd, capture_output=True, text=True, env=_env())
     assert res.returncode == 0
 
     compressed_file = dst_dir / "sample.md"
@@ -60,13 +71,13 @@ def test_sidecar_envelope_e2e_roundtrip(tmp_path):
         "--dst", str(decomp_out),
         "--sidecar", str(sidecar_file)
     ]
-    res_decomp = subprocess.run(cmd_decomp, capture_output=True, text=True)
+    res_decomp = subprocess.run(cmd_decomp, capture_output=True, text=True, env=_env())
     assert res_decomp.returncode == 5
     assert "Missing required sidecar file" in res_decomp.stderr or "Sidecar validation failed" in res_decomp.stderr
 
     # Restore sidecar and test CLI decompress -> success
     sidecar_file.write_text(sidecar_backup, encoding="utf-8")
-    res_decomp_ok = subprocess.run(cmd_decomp, capture_output=True, text=True)
+    res_decomp_ok = subprocess.run(cmd_decomp, capture_output=True, text=True, env=_env())
     assert res_decomp_ok.returncode == 0
     assert decomp_out.read_text(encoding="utf-8") == content
 
@@ -87,7 +98,7 @@ def test_unmodified_file_no_envelope(tmp_path):
         "--dst", str(dst_dir),
         "--mode", "lossless"
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    res = subprocess.run(cmd, capture_output=True, text=True, env=_env())
     assert res.returncode == 0
 
     compressed_file = dst_dir / "short.md"

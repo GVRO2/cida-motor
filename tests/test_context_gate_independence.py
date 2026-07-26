@@ -31,11 +31,11 @@ def _sessions(result: str = "PASS"):
 
 
 def _corpora():
-    return {"ten_chunks": {"alias_count": 5000, "chunk_count": 10}}
+    return {"hundred_chunks": {"alias_count": 500, "chunk_count": 100}}
 
 
 def _production():
-    return {"ten_chunks": {"exit_code": 0}}
+    return {"hundred_chunks": {"exit_code": 0}}
 
 
 def test_overall_result_fails_when_lookup_gate_fails():

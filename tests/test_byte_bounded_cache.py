@@ -1,4 +1,4 @@
-from cida.infrastructure.byte_bounded_cache import ByteBoundedLRUCache
+from cida.infrastructure.byte_bounded_cache import ByteBoundedLRUCache, PinnedCacheBudgetError
 import pytest
 
 
@@ -53,9 +53,11 @@ def test_byte_bounded_cache_updates_existing_entry_and_handles_pinned_pressure()
     assert cache.put("a", b"aa", artifact_type="manifest") is True
     assert cache.put("a", b"a", artifact_type="manifest") is True
     assert cache.put("pinned", b"bbb", artifact_type="alias_index", pinned=True) is True
-    assert cache.put("second-pinned", b"bb", artifact_type="alias_index", pinned=True) is True
+    with pytest.raises(PinnedCacheBudgetError):
+        cache.put("second-pinned", b"bb", artifact_type="alias_index", pinned=True)
 
     assert cache.current_bytes <= 4
     assert cache.get("a") is None
-    assert cache.get("second-pinned") == b"bb"
-    assert cache.bytes_by_artifact_type == {"alias_index": 2}
+    assert cache.get("pinned") == b"bbb"
+    assert cache.get("second-pinned") is None
+    assert cache.bytes_by_artifact_type == {"alias_index": 3}

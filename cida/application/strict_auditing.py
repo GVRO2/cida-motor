@@ -20,6 +20,8 @@ class StrictBundleAuditor:
         output_root: str,
         output_file: str,
         sidecar_file: Optional[str] = None,
+        preloaded_source_bytes: Optional[bytes] = None,
+        preloaded_output_bytes: Optional[bytes] = None,
     ) -> None:
         """Re-read persisted output and sidecar, then validate the physical bundle."""
         self._sidecar_validator.validate_output_bundle(
@@ -27,4 +29,6 @@ class StrictBundleAuditor:
             output_root,
             output_file,
             sidecar_file=sidecar_file,
+            preloaded_source_bytes=preloaded_source_bytes,
+            preloaded_output_bytes=preloaded_output_bytes,
         )

@@ -14,12 +14,24 @@ import venv
 from io import BytesIO
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-MEDIAN_BUDGET = 0.05
-P95_BUDGET = 0.10
-RSS_BUDGET = 0.10
-STABILITY_CV_LIMIT = 0.10
-MAX_BALANCED_SCENARIO_ATTEMPTS = 3
+from harness.benchmark_policy_auditor import load_benchmark_policy  # noqa: E402
+from harness.process_tree_probe import ProcessTreeSampler  # noqa: E402
+from harness.runtime_harness_probe import OriginalProjectHarness  # noqa: E402
+
+POLICY = load_benchmark_policy()
+MEDIAN_BUDGET = POLICY.median_budget
+P95_BUDGET = POLICY.p95_budget
+RSS_BUDGET = POLICY.rss_budget
+STABILITY_CV_LIMIT = POLICY.stability_cv_limit
+MAX_STABILITY_COLLECTION_ROUNDS = 8
+
+
+def _go_executable() -> str:
+    return os.environ.get("CIDA_GO_BIN") or "go"
 
 
 def _run(cmd: list[str], cwd: Path, **kwargs) -> subprocess.CompletedProcess:
@@ -52,9 +64,9 @@ def _copy_head(repo: Path, destination: Path) -> None:
 
 def _build_binary(project: Path, output: Path) -> None:
     exe = output / ("motor_v3.exe" if sys.platform == "win32" else "motor_v3")
-    result = _run(["go", "build", "-o", str(exe), "motor_v3.go"], project)
+    result = _run([_go_executable(), "build", "-o", str(exe), "motor_v3.go"], project)
     if result.returncode != 0:
-        raise RuntimeError(f"go build failed in {project}:\n{result.stderr}")
+        raise RuntimeError(f"go build failed in {project}:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
 
 
 def _venv_python(venv_dir: Path) -> Path:
@@ -68,9 +80,14 @@ def _python_bin_dir(python_exe: Path) -> Path:
 
 
 def _prepare_python_env(project: Path, venv_dir: Path, install_legacy_yaml: bool = False) -> Path:
-    builder = venv.EnvBuilder(with_pip=True, system_site_packages=True)
+    builder = venv.EnvBuilder(with_pip=True, system_site_packages=False)
     builder.create(venv_dir)
     python_exe = _venv_python(venv_dir)
+    requirements = project / "requirements-runtime.txt"
+    if requirements.exists():
+        result = _pip_install(python_exe, project, ["-r", str(requirements)])
+        if result.returncode != 0:
+            raise RuntimeError(f"failed to install benchmark runtime dependencies for {project}:\n{result.stdout}\n{result.stderr}")
     tiktoken_check = subprocess.run(
         [str(python_exe), "-c", "import tiktoken"],
         cwd=str(project),
@@ -79,7 +96,7 @@ def _prepare_python_env(project: Path, venv_dir: Path, install_legacy_yaml: bool
         check=False,
     )
     if tiktoken_check.returncode != 0:
-        raise RuntimeError("base benchmark environment cannot import tiktoken from the current CI environment")
+        raise RuntimeError(f"benchmark environment cannot import tiktoken for {project}:\n{tiktoken_check.stderr.decode('utf-8', errors='replace')}")
     if not install_legacy_yaml:
         return python_exe
     yaml_check = subprocess.run([str(python_exe), "-c", "import yaml"], cwd=str(project), stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
@@ -92,8 +109,42 @@ def _prepare_python_env(project: Path, venv_dir: Path, install_legacy_yaml: bool
                 break
         if not pyyaml_requirement:
             return python_exe
+        result = _pip_install(python_exe, project, [pyyaml_requirement])
+        if result.returncode != 0:
+            raise RuntimeError(f"failed to install benchmark environment for {project}:\n{result.stdout}\n{result.stderr}")
+    return python_exe
+
+
+def _pip_install(python_exe: Path, project: Path, install_args: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [str(python_exe), "-m", "pip", "install", "--use-feature=truststore", *install_args],
+        cwd=str(project),
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def _requirements_sha256(project: Path) -> str:
+    digest = hashlib.sha256()
+    for name in ("requirements-runtime.txt", "requirements-ci.txt", "requirements-dev.txt"):
+        path = project / name
+        if not path.exists():
+            continue
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _python_env_evidence(project: Path, python_exe: Path) -> dict:
+    def run_python(code: str) -> str:
         result = subprocess.run(
-            [str(python_exe), "-m", "pip", "install", pyyaml_requirement],
+            [str(python_exe), "-c", code],
             cwd=str(project),
             text=True,
             encoding="utf-8",
@@ -102,9 +153,38 @@ def _prepare_python_env(project: Path, venv_dir: Path, install_legacy_yaml: bool
             stderr=subprocess.PIPE,
             check=False,
         )
-        if result.returncode != 0:
-            raise RuntimeError(f"failed to install benchmark environment for {project}:\n{result.stdout}\n{result.stderr}")
-    return python_exe
+        return result.stdout.strip() if result.returncode == 0 else f"unavailable: {result.stderr.strip()}"
+
+    pip_version = subprocess.run(
+        [str(python_exe), "-m", "pip", "--version"],
+        cwd=str(project),
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    freeze = subprocess.run(
+        [str(python_exe), "-m", "pip", "freeze"],
+        cwd=str(project),
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    return {
+        "python_executable": str(python_exe),
+        "python_version": run_python("import sys; print(sys.version.replace('\\n', ' '))"),
+        "pip_version": pip_version.stdout.strip() if pip_version.returncode == 0 else pip_version.stderr.strip(),
+        "pip_freeze": freeze.stdout.splitlines() if freeze.returncode == 0 else [],
+        "requirements_sha256": _requirements_sha256(project),
+        "tiktoken_version": run_python("import tiktoken; print(getattr(tiktoken, '__version__', 'unknown'))"),
+        "pyyaml_version": run_python("import yaml; print(getattr(yaml, '__version__', 'missing'))"),
+        "system_site_packages": False,
+    }
 
 
 def _python_cli_command(project: Path, python_executable: Path | None = None) -> list[str]:
@@ -166,20 +246,26 @@ def _write_scenario(root: Path, name: str, file_count: int, kind: str) -> tuple[
         paths = [source / "App.java"]
     elif kind == "mixed":
         paths = [source / f"doc-{i:03d}.md" for i in range(file_count - 1)] + [source / "App.java"]
-        content = "# Mixed\n\n" + ("repeated_identifier_for_dictionary " * 80) + "\n"
+        content = "# Mixed\n\n" + ("repeated_identifier_for_dictionary " * 800) + "\n"
     elif kind == "bmad":
-        content = "# BMAD Workflow\n\n<!-- stepsCompleted: 1 -->\n\n" + "\n".join(f"- step {i}" for i in range(80))
+        content = "# BMAD Workflow\n\n<!-- stepsCompleted: 1 -->\n\n" + "\n".join(f"- step {i}" for i in range(8000))
         paths = [source / "workflow.md"]
     elif kind == "repetitive":
         content = "# Repetitive\n\n" + ("supercalifragilisticexpialidocious " * 300) + "\n"
         paths = [source / "repetitive.md"]
     else:
-        content = "# Small\n\nShort markdown with a table.\n\n| A | B |\n| - | - |\n| 1 | 2 |\n"
+        row_count = 1200 if file_count <= 10 else 120
+        rows = "\n".join(f"| {i} | {i + 1} |" for i in range(row_count))
+        content = "# Small\n\nShort table.\n\n| A | B |\n| - | - |\n" + rows + "\n"
         paths = [source / f"doc-{i:03d}.md" for i in range(file_count)]
 
     for path in paths:
         if path.suffix == ".java":
-            data = "public class App { public void run() { int total = 0; total += 1; } }\n"
+            methods = "\n".join(
+                f"    public int value{i}() {{ int total = {i}; total += 1; return total; }}"
+                for i in range(160)
+            )
+            data = "public class App {\n" + methods + "\n}\n"
         else:
             data = content
         path.write_text(data, encoding="utf-8")
@@ -265,13 +351,15 @@ def _measure(command: list[str], project: Path, source: Path, destination: Path,
         encoding="utf-8",
         errors="replace",
     )
-    peak_rss = 0
+    sampler = ProcessTreeSampler(proc.pid)
     while proc.poll() is None:
-        peak_rss = max(peak_rss, _process_rss_bytes(proc.pid))
+        sampler.sample()
         time.sleep(0.005)
     stdout, stderr = proc.communicate()
     elapsed = time.perf_counter() - start
-    peak_rss = max(peak_rss, _process_rss_bytes(proc.pid))
+    sampler.sample()
+    process_metrics = sampler.metrics()
+    peak_rss = process_metrics.process_tree_peak_rss
     if proc.returncode != 0:
         raise RuntimeError(f"benchmark command failed ({proc.returncode}):\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}")
 
@@ -290,6 +378,11 @@ def _measure(command: list[str], project: Path, source: Path, destination: Path,
     return {
         "duration_seconds": elapsed,
         "peak_rss_bytes": peak_rss,
+        "parent_peak_rss": process_metrics.parent_peak_rss,
+        "children_peak_rss": process_metrics.children_peak_rss,
+        "process_tree_peak_rss": process_metrics.process_tree_peak_rss,
+        "peak_process_count": process_metrics.peak_process_count,
+        "child_pids_seen": list(process_metrics.child_pids_seen),
         "files_per_second": file_count / elapsed if elapsed > 0 else 0,
         "mb_per_second": (bytes_processed / (1024 * 1024)) / elapsed if elapsed > 0 else 0,
         "milliseconds_per_file": (elapsed * 1000) / len(report_entries) if report_entries else 0,
@@ -381,7 +474,9 @@ def _summarize(samples: list[dict], output_hashes: list[str]) -> dict:
     cv = (stddev / mean_dur) if mean_dur > 0 else 0.0
 
     return {
+        "raw_samples": samples,
         "raw_durations": durations,
+        "sample_count": len(samples),
         "median": statistics.median(durations),
         "p95": _p95(durations),
         "minimum": min(durations),
@@ -389,6 +484,11 @@ def _summarize(samples: list[dict], output_hashes: list[str]) -> dict:
         "standard_deviation": stddev,
         "cv": cv,
         "peak_rss": max(rss_values),
+        "parent_peak_rss": max(sample["parent_peak_rss"] for sample in samples),
+        "children_peak_rss": max(sample["children_peak_rss"] for sample in samples),
+        "process_tree_peak_rss": max(sample["process_tree_peak_rss"] for sample in samples),
+        "peak_process_count": max(sample["peak_process_count"] for sample in samples),
+        "child_pids_seen": sorted({pid for sample in samples for pid in sample["child_pids_seen"]}),
         "files_per_second": statistics.median(files_per_second),
         "tokens_per_second": statistics.median(tokens_per_second),
         "mb_per_second": statistics.median(sample["mb_per_second"] for sample in samples),
@@ -421,8 +521,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Compare CIDA performance against a git base ref.")
     parser.add_argument("--base-ref", default="origin/main")
     parser.add_argument("--head-dir", default=".")
-    parser.add_argument("--runs", type=int, default=5)
-    parser.add_argument("--warmups", type=int, default=1)
+    parser.add_argument("--runs", type=int, default=POLICY.balanced_runs)
+    parser.add_argument("--warmups", type=int, default=POLICY.balanced_warmups)
     parser.add_argument("--validation-level", default="balanced", choices=["balanced", "strict"], help="Validation level for performance comparison")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
@@ -434,11 +534,11 @@ def main() -> None:
         ("markdown-small", "go", 1, "small", ["--profile", "markdown", "--dictionary-scope", "file"]),
         ("markdown-repetitive", "go", 1, "repetitive", ["--profile", "markdown", "--dictionary-scope", "file"]),
         ("bmad", "go", 1, "bmad", ["--profile", "bmad", "--dictionary-scope", "file"]),
-        ("corpus-10-cache-on", "python", 10, "small", ["--mode", "semantic", "--profile", "markdown", "--dictionary-scope", "corpus"]),
-        ("corpus-100-cache-on", "python", 100, "small", ["--mode", "semantic", "--profile", "markdown", "--dictionary-scope", "corpus"]),
-        ("java-semantic", "python", 1, "java", ["--mode", "semantic", "--profile", "java", "--dictionary-scope", "none"]),
-        ("corpus-mixed", "python", 10, "mixed", ["--mode", "semantic", "--profile", "auto", "--dictionary-scope", "corpus"]),
-        ("corpus-10-cache-off", "python", 10, "small", ["--mode", "semantic", "--profile", "markdown", "--dictionary-scope", "corpus", "--no-cache"]),
+        ("corpus-10-cache-on", "python", 10, "small", ["--mode", "semantic", "--profile", "markdown", "--dictionary-scope", "corpus", "--workers", "1"]),
+        ("corpus-100-cache-on", "python", 100, "small", ["--mode", "semantic", "--profile", "markdown", "--dictionary-scope", "corpus", "--workers", "1"]),
+        ("java-semantic", "python", 1, "java", ["--mode", "semantic", "--profile", "java", "--dictionary-scope", "none", "--workers", "1"]),
+        ("corpus-mixed", "python", 10, "mixed", ["--mode", "semantic", "--profile", "auto", "--dictionary-scope", "corpus", "--workers", "1"]),
+        ("corpus-10-cache-off", "python", 10, "small", ["--mode", "semantic", "--profile", "markdown", "--dictionary-scope", "corpus", "--workers", "1", "--no-cache"]),
     ]
 
     try:
@@ -459,7 +559,7 @@ def main() -> None:
         diff_bytes = _run(["git", "diff"], repo).stdout.encode("utf-8")
         head_diff_sha256 = hashlib.sha256(diff_bytes).hexdigest()
 
-        go_version_res = _run(["go", "version"], repo)
+        go_version_res = _run([_go_executable(), "version"], repo)
         go_version = go_version_res.stdout.strip() if go_version_res.returncode == 0 else "unknown"
 
         results = {
@@ -477,13 +577,16 @@ def main() -> None:
             "warmups": args.warmups,
             "runs": args.runs,
             "validation_level": args.validation_level,
+            "policy_sha256": POLICY.sha256,
             "budgets": {
                 "median": MEDIAN_BUDGET,
                 "p95": P95_BUDGET,
                 "peak_rss": RSS_BUDGET,
                 "stability_cv": STABILITY_CV_LIMIT,
-                "max_balanced_scenario_attempts": MAX_BALANCED_SCENARIO_ATTEMPTS,
-                "enforced": args.validation_level == "balanced",
+                "allow_timing_skip": POLICY.allow_timing_skip,
+                "allow_parent_only_rss": POLICY.allow_parent_only_rss,
+                "allow_system_site_packages": POLICY.allow_system_site_packages,
+                "enforced": True,
             },
             "scenarios": {},
         }
@@ -495,6 +598,17 @@ def main() -> None:
         head_python = _prepare_python_env(head_dir, temp_root / "head-venv")
         head_python_bin = _python_bin_dir(head_python)
         head_python_cmd = _python_cli_command(head_dir, head_python)
+        results["python_environments"] = {
+            "base": _python_env_evidence(base_dir, base_python),
+            "head": _python_env_evidence(head_dir, head_python),
+        }
+        inspector = OriginalProjectHarness()
+        results["runtime_dependency_graphs"] = {
+            "base_go": inspector.inspect(base_dir, "go").__dict__,
+            "head_go": inspector.inspect(head_dir, "go").__dict__,
+            "base_python": inspector.inspect(base_dir, "python").__dict__,
+            "head_python": inspector.inspect(head_dir, "python").__dict__,
+        }
         base_supports_no_cache = _supports_flag(base_dir, base_python_cmd, "--no-cache")
         base_supports_val_level = _supports_flag(base_dir, base_python_cmd, "--validation-level")
 
@@ -541,24 +655,26 @@ def main() -> None:
                 return eff
 
             cmd_str = f"motor_v3 {' '.join(flags)}" if runner == "go" else f"python -m cida.interfaces.cli {' '.join(flags)}"
-            max_attempts = MAX_BALANCED_SCENARIO_ATTEMPTS if args.validation_level == "balanced" else 1
+            round_limit = MAX_STABILITY_COLLECTION_ROUNDS
             attempt_summaries = []
             base_implementation_sha256 = _implementation_fingerprint(base_dir, runner)
             head_implementation_sha256 = _implementation_fingerprint(head_dir, runner)
             implementation_delta = base_implementation_sha256 != head_implementation_sha256
 
-            for attempt in range(1, max_attempts + 1):
-                samples_map = {"base": [], "head": []}
-                hashes_map = {"base": [], "head": []}
+            samples_map = {"base": [], "head": []}
+            hashes_map = {"base": [], "head": []}
+            round_no = 1
 
+            while True:
                 # Warmups: alternating order.
-                for w in range(args.warmups):
-                    warmup_order = version_configs if w % 2 == 0 else list(reversed(version_configs))
-                    for version, binary, _project, python_bin in warmup_order:
-                        command = [str(binary)] if runner == "go" else (base_python_cmd if version == "base" else head_python_cmd)
-                        effective_flags = build_effective_flags(version)
-                        dest = temp_root / "runs" / scenario_name / f"attempt-{attempt:02d}" / version / f"warmup-{w:02d}"
-                        _measure(command, _project, source, dest, effective_flags, python_bin)
+                if round_no == 1:
+                    for w in range(args.warmups):
+                        warmup_order = version_configs if w % 2 == 0 else list(reversed(version_configs))
+                        for version, binary, _project, python_bin in warmup_order:
+                            command = [str(binary)] if runner == "go" else (base_python_cmd if version == "base" else head_python_cmd)
+                            effective_flags = build_effective_flags(version)
+                            dest = temp_root / "runs" / scenario_name / f"round-{round_no:02d}" / version / f"warmup-{w:02d}"
+                            _measure(command, _project, source, dest, effective_flags, python_bin)
 
                 # Measured runs: alternating order.
                 for r in range(args.runs):
@@ -566,7 +682,7 @@ def main() -> None:
                     for version, binary, _project, python_bin in run_order:
                         command = [str(binary)] if runner == "go" else (base_python_cmd if version == "base" else head_python_cmd)
                         effective_flags = build_effective_flags(version)
-                        dest = temp_root / "runs" / scenario_name / f"attempt-{attempt:02d}" / version / f"run-{r:02d}"
+                        dest = temp_root / "runs" / scenario_name / f"round-{round_no:02d}" / version / f"run-{r:02d}"
 
                         sample = _measure(command, _project, source, dest, effective_flags, python_bin)
                         samples_map[version].append(sample)
@@ -588,12 +704,11 @@ def main() -> None:
                 is_unstable = base_summary["cv"] > STABILITY_CV_LIMIT or head_summary["cv"] > STABILITY_CV_LIMIT
                 stability_str = "UNSTABLE" if is_unstable else "STABLE"
                 output_equivalent = base_summary["output_tree_sha256"] == head_summary["output_tree_sha256"]
-                timing_gate_skipped = args.validation_level == "balanced" and not implementation_delta
-                budget_result = raw_budget_result or timing_gate_skipped
-                gate_result = True if timing_gate_skipped else budget_result and not is_unstable
+                budget_result = raw_budget_result
+                gate_result = budget_result and not is_unstable
                 attempt_summaries.append(
                     {
-                        "attempt": attempt,
+                        "attempt": round_no,
                         "budget_result": "PASS" if budget_result else "FAIL",
                         "raw_budget_result": "PASS" if raw_budget_result else "FAIL",
                         "stability": stability_str,
@@ -601,16 +716,32 @@ def main() -> None:
                         "head_cv": head_summary["cv"],
                         "implementation_delta": implementation_delta,
                         "output_equivalent": output_equivalent,
-                        "timing_gate_skipped_reason": "SKIPPED_NO_IMPLEMENTATION_DELTA" if timing_gate_skipped else "",
                         "comparison": comparison,
                     }
                 )
+                print(
+                    json.dumps(
+                        {
+                            "scenario": scenario_name,
+                            "round": round_no,
+                            "stability": stability_str,
+                            "budget_result": "PASS" if budget_result else "FAIL",
+                            "base_cv": base_summary["cv"],
+                            "head_cv": head_summary["cv"],
+                            "comparison": comparison,
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
 
-                should_retry = args.validation_level == "balanced" and not gate_result and attempt < max_attempts
-                if should_retry:
+                should_extend_for_instability = is_unstable and round_no < round_limit
+                if should_extend_for_instability:
+                    round_no += 1
                     continue
 
-                if args.validation_level == "balanced" and not gate_result:
+                if not gate_result:
                     failed.append(scenario_name)
 
                 results["scenarios"][scenario_name] = {
@@ -626,8 +757,8 @@ def main() -> None:
                     "validation_level": args.validation_level,
                     "warmups": args.warmups,
                     "runs": args.runs,
-                    "attempt": attempt,
-                    "max_attempts": max_attempts,
+                    "attempt": round_no,
+                    "measurement_round_limit": round_limit,
                     "flags": flags,
                     "unsupported_base_flags": sorted(set(unsupported_base_flags)),
                     "base": base_summary,
@@ -638,12 +769,11 @@ def main() -> None:
                     "head_implementation_sha256": head_implementation_sha256,
                     "implementation_delta": implementation_delta,
                     "output_equivalent": output_equivalent,
-                    "timing_gate_skipped_reason": "SKIPPED_NO_IMPLEMENTATION_DELTA" if timing_gate_skipped else "",
                     "budget_result": "PASS" if budget_result else "FAIL",
                     "raw_budget_result": "PASS" if raw_budget_result else "FAIL",
                     "stability_result": "FAIL" if is_unstable else "PASS",
                     "gate_result": "PASS" if gate_result else "FAIL",
-                    "budget_enforced": args.validation_level == "balanced",
+                    "budget_enforced": True,
                     "attempts": attempt_summaries,
                 }
                 break

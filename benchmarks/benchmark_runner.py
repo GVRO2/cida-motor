@@ -32,6 +32,7 @@ def main():
     # Configure offline environment
     env = os.environ.copy()
     env["TIKTOKEN_CACHE_DIR"] = os.path.join(project_root, "resources")
+    go_executable = os.environ.get("CIDA_GO_BIN") or "go"
 
     print("==============================================================")
     print("RUNNING CIDA MOTOR BENCHMARK SUITE (DETERMINISTIC VERIFICATION)")
@@ -60,7 +61,7 @@ def main():
 
     try:
         print(f"Building Go binary in temp dir: {go_cli}...")
-        build_cmd = ["go", "build", "-o", go_cli, "motor_v3.go"]
+        build_cmd = [go_executable, "build", "-o", go_cli, "motor_v3.go"]
         build_res = subprocess.run(build_cmd, cwd=project_root, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if build_res.returncode != 0:
             print(f"Error building Go binary:\n{build_res.stderr.decode('utf-8')}")

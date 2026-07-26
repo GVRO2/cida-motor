@@ -1,13 +1,7 @@
 from cida.application.ports import TokenCounter, FileRepository, HashService, JsonCodec, DictionaryBuilder
-from cida.application.selective_alias_resolution import (
-    ALIAS_INDEX_FILENAME,
-    build_alias_index_artifacts,
-    corpus_chunk_filename,
-)
-from cida.domain.alias_codec import DEFAULT_ALIAS_CODEC
 from cida.domain.errors import SourcePathError, InternalProcessingError
 from cida.domain.policies import is_binary_extension
-from cida.domain.processing_context import FileInventory
+from cida.domain.processing_context import FileInventory, ProcessingContext
 
 
 class CorpusOptimizerUsecase:
@@ -24,6 +18,8 @@ class CorpusOptimizerUsecase:
 
     @staticmethod
     def _items_sorted_by_alias(corpus_dict: dict) -> list[tuple[str, str]]:
+        from cida.domain.alias_codec import DEFAULT_ALIAS_CODEC
+
         return sorted(corpus_dict.items(), key=lambda item: DEFAULT_ALIAS_CODEC.decode_alias(item[1]).ordinal)
 
     def build_file_inventory(
@@ -68,34 +64,46 @@ class CorpusOptimizerUsecase:
         return inventory
 
     def build_corpus_dict(self, files: list, src_abs: str, skip_binary_check: bool = False) -> tuple:
-        all_contents = []
-        text_by_path = {}
+        sources: list[tuple[str, str, str, str]] = []
         for fp in files:
             if (skip_binary_check or not self.file_repo.is_binary_file(fp)) and (fp.endswith('.md') or fp.endswith('.txt')):
                 try:
                     content = self.file_repo.read_text(fp)
-                    text_by_path[fp] = content
-                    all_contents.append(content)
                 except Exception as exc:
                     raise SourcePathError(
                         f"Failed to read corpus source '{fp}': {exc}"
                     ) from exc
+                try:
+                    rel = self.file_repo.relpath(fp, src_abs).replace('\\', '/')
+                    sources.append((fp, rel, content, ""))
+                except Exception as exc:
+                    raise InternalProcessingError(f"Failed to prepare corpus source '{fp}': {exc}") from exc
+        return self._build_corpus_dict_from_sources(sources)
+
+    def build_corpus_dict_from_contexts(self, contexts: list[ProcessingContext]) -> tuple:
+        sources = [
+            (ctx.source_path, ctx.relative_path.replace("\\", "/"), ctx.source_text, ctx.source_sha256)
+            for ctx in contexts
+            if ctx.source_path.endswith(('.md', '.txt'))
+        ]
+        return self._build_corpus_dict_from_sources(sources)
+
+    def _build_corpus_dict_from_sources(self, sources: list[tuple[str, str, str, str]]) -> tuple:
+        all_contents = [content for _, _, content, _ in sources]
         corpus_dict = self.dictionary_builder.build_corpus_dictionary(all_contents, self.token_counter)
         if not corpus_dict:
             return {}, "", 0, 0
 
         manifest_files = []
-        for fp in files:
-            if (skip_binary_check or not self.file_repo.is_binary_file(fp)) and (fp.endswith('.md') or fp.endswith('.txt')):
-                rel = self.file_repo.relpath(fp, src_abs).replace('\\', '/')
-                try:
-                    source_bytes = text_by_path[fp].encode('utf-8')
-                    sha = self.hash_service.sha256(source_bytes)
-                    manifest_files.append({"path": rel, "sha256": sha})
-                except Exception as exc:
-                    raise InternalProcessingError(
-                        f"Failed to hash corpus source '{fp}': {exc}"
-                    ) from exc
+        for fp, rel, content, source_sha256 in sources:
+            try:
+                if not source_sha256:
+                    source_sha256 = self.hash_service.sha256(content.encode("utf-8"))
+                manifest_files.append({"path": rel, "sha256": source_sha256})
+            except Exception as exc:
+                raise InternalProcessingError(
+                    f"Failed to hash corpus source '{fp}': {exc}"
+                ) from exc
         manifest_files.sort(key=lambda x: x["path"])
         manifest = {"format": "cida-corpus-manifest", "schema_version": 2, "files": manifest_files}
         manifest_bytes = self.json_codec.canonical_encode(manifest).encode('utf-8')
@@ -122,15 +130,27 @@ class CorpusOptimizerUsecase:
                 "entries_sha256": entries_sha256,
                 "entries": entries_map
             }
-            sidecar_tokens_total += self.token_counter.count(self.json_codec.encode(sidecar_data, indent=4))
+            sidecar_tokens_total += self.token_counter.count(self.json_codec.canonical_encode(sidecar_data))
 
         auxiliary_tokens = self.token_counter.count("Use the companion sidecar file to resolve aliases.")
 
         return corpus_dict, corpus_hash, sidecar_tokens_total, auxiliary_tokens
 
-    def write_corpus_sidecars(self, corpus_dict: dict, corpus_hash: str, dst_abs: str) -> dict[str, str]:
+    def write_corpus_sidecars(
+        self,
+        corpus_dict: dict,
+        corpus_hash: str,
+        dst_abs: str,
+        artifact_sizes: dict[str, int] | None = None,
+    ) -> dict[str, str]:
         if not corpus_dict:
             return {}
+        from cida.application.selective_alias_resolution import (
+            ALIAS_INDEX_FILENAME,
+            build_alias_index_artifacts,
+            corpus_chunk_filename,
+        )
+
         artifact_hashes: dict[str, str] = {}
         items = self._items_sorted_by_alias(corpus_dict)
         tknd_dir = self.file_repo.join(dst_abs, "tknd")
@@ -162,11 +182,15 @@ class CorpusOptimizerUsecase:
                 raise InternalProcessingError(f"Duplicate corpus chunk filename generated: {chunk_filename}")
             filenames_seen.add(chunk_filename)
             dict_file_path = self.file_repo.join(tknd_dir, chunk_filename)
-            serialized = self.json_codec.encode(sidecar_data, indent=4)
-            self.file_repo.write_text(dict_file_path, serialized)
-            chunk_hash = self.hash_service.sha256(serialized.encode("utf-8"))
+            serialized = self.json_codec.canonical_encode(sidecar_data)
+            serialized_bytes = serialized.encode("utf-8")
+            self.file_repo.write_bytes(dict_file_path, serialized_bytes)
+            chunk_hash = self.hash_service.sha256(serialized_bytes)
             chunk_hashes[chunk_filename] = chunk_hash
-            artifact_hashes[f"tknd/{chunk_filename}"] = chunk_hash
+            rel_chunk = f"tknd/{chunk_filename}"
+            artifact_hashes[rel_chunk] = chunk_hash
+            if artifact_sizes is not None:
+                artifact_sizes[rel_chunk] = len(serialized_bytes)
             chunk_entry_counts[chunk_filename] = len(entries_map)
             chunk_entries_sha256[chunk_filename] = entries_sha256
             for alias in entries_map:
@@ -186,16 +210,27 @@ class CorpusOptimizerUsecase:
         )
         for segment_path, segment_data in sorted(index_artifacts.segments.items()):
             full_segment_path = self.file_repo.join(tknd_dir, *segment_path.split("/"))
-            segment_text = self.json_codec.encode(segment_data, indent=4)
-            self.file_repo.write_text(full_segment_path, segment_text)
-            artifact_hashes[f"tknd/{segment_path}"] = self.hash_service.sha256(segment_text.encode("utf-8"))
+            segment_text = self.json_codec.canonical_encode(segment_data)
+            segment_bytes = segment_text.encode("utf-8")
+            self.file_repo.write_bytes(full_segment_path, segment_bytes)
+            rel_segment = f"tknd/{segment_path}"
+            artifact_hashes[rel_segment] = self.hash_service.sha256(segment_bytes)
+            if artifact_sizes is not None:
+                artifact_sizes[rel_segment] = len(segment_bytes)
         index_path = self.file_repo.join(tknd_dir, ALIAS_INDEX_FILENAME)
-        index_text = self.json_codec.encode(index_artifacts.root, indent=4)
-        self.file_repo.write_text(index_path, index_text)
-        artifact_hashes[f"tknd/{ALIAS_INDEX_FILENAME}"] = self.hash_service.sha256(index_text.encode("utf-8"))
+        index_text = self.json_codec.canonical_encode(index_artifacts.root)
+        index_bytes = index_text.encode("utf-8")
+        self.file_repo.write_bytes(index_path, index_bytes)
+        rel_index = f"tknd/{ALIAS_INDEX_FILENAME}"
+        artifact_hashes[rel_index] = self.hash_service.sha256(index_bytes)
+        if artifact_sizes is not None:
+            artifact_sizes[rel_index] = len(index_bytes)
         if self._last_manifest is not None:
             manifest_path = self.file_repo.join(dst_abs, "tknc-manifest.json")
-            manifest_text = self.json_codec.encode(self._last_manifest, indent=4)
-            self.file_repo.write_text(manifest_path, manifest_text)
-            artifact_hashes["tknc-manifest.json"] = self.hash_service.sha256(manifest_text.encode("utf-8"))
+            manifest_text = self.json_codec.canonical_encode(self._last_manifest)
+            manifest_bytes = manifest_text.encode("utf-8")
+            self.file_repo.write_bytes(manifest_path, manifest_bytes)
+            artifact_hashes["tknc-manifest.json"] = self.hash_service.sha256(manifest_bytes)
+            if artifact_sizes is not None:
+                artifact_sizes["tknc-manifest.json"] = len(manifest_bytes)
         return artifact_hashes
