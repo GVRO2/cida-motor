@@ -167,11 +167,18 @@ def test_policy_loader_hashes_exact_policy_file(tmp_path):
 
 
 def test_summarize_samples_empty_and_nonempty():
-    assert summarize_samples([]) == {"median": 0.0, "p95": 0.0, "cv": 0.0}
+    empty = summarize_samples([])
+    assert empty["median"] == 0.0
+    assert empty["p95"] == 0.0
+    assert empty["cv"] == 0.0
     result = summarize_samples([1.0, 2.0, 3.0])
     assert result["median"] == 2.0
     assert result["p95"] == 3.0
     assert result["cv"] > 0
+    outlier = summarize_samples([1.0, 1.01, 1.0, 1.02, 5.0])
+    assert outlier["raw_p95"] == 5.0
+    assert outlier["p95"] < 5.0
+    assert outlier["duration_outliers_capped"] == 1.0
 
 
 def test_valid_report_fixture_is_copyable_without_mutating_source():

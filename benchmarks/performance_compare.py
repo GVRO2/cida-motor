@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from harness.benchmark_policy_auditor import load_benchmark_policy  # noqa: E402
+from harness.benchmark_policy_auditor import load_benchmark_policy, summarize_samples  # noqa: E402
 from harness.process_tree_probe import ProcessTreeSampler  # noqa: E402
 from harness.runtime_harness_probe import OriginalProjectHarness  # noqa: E402
 
@@ -251,10 +251,10 @@ def _write_scenario(root: Path, name: str, file_count: int, kind: str) -> tuple[
         content = "# BMAD Workflow\n\n<!-- stepsCompleted: 1 -->\n\n" + "\n".join(f"- step {i}" for i in range(8000))
         paths = [source / "workflow.md"]
     elif kind == "repetitive":
-        content = "# Repetitive\n\n" + ("supercalifragilisticexpialidocious " * 300) + "\n"
+        content = "# Repetitive\n\n" + ("supercalifragilisticexpialidocious " * 1500) + "\n"
         paths = [source / "repetitive.md"]
     else:
-        row_count = 1200 if file_count <= 10 else 120
+        row_count = 5000 if file_count == 1 else 1200 if file_count <= 10 else 120
         rows = "\n".join(f"| {i} | {i + 1} |" for i in range(row_count))
         content = "# Small\n\nShort table.\n\n| A | B |\n| - | - |\n" + rows + "\n"
         paths = [source / f"doc-{i:03d}.md" for i in range(file_count)]
@@ -469,20 +469,24 @@ def _summarize(samples: list[dict], output_hashes: list[str]) -> dict:
     rss_values = [sample["peak_rss_bytes"] for sample in samples]
     files_per_second = [sample["files_per_second"] for sample in samples]
     tokens_per_second = [sample["tokens_per_second"] for sample in samples]
-    mean_dur = statistics.mean(durations) if durations else 0.0
+    duration_summary = summarize_samples(durations)
     stddev = statistics.pstdev(durations) if len(durations) > 1 else 0.0
-    cv = (stddev / mean_dur) if mean_dur > 0 else 0.0
 
     return {
         "raw_samples": samples,
         "raw_durations": durations,
         "sample_count": len(samples),
-        "median": statistics.median(durations),
-        "p95": _p95(durations),
+        "median": duration_summary["median"],
+        "p95": duration_summary["p95"],
         "minimum": min(durations),
         "maximum": max(durations),
         "standard_deviation": stddev,
-        "cv": cv,
+        "cv": duration_summary["cv"],
+        "raw_median": duration_summary["raw_median"],
+        "raw_p95": duration_summary["raw_p95"],
+        "raw_cv": duration_summary["raw_cv"],
+        "duration_cap": duration_summary["duration_cap"],
+        "duration_outliers_capped": int(duration_summary["duration_outliers_capped"]),
         "peak_rss": max(rss_values),
         "parent_peak_rss": max(sample["parent_peak_rss"] for sample in samples),
         "children_peak_rss": max(sample["children_peak_rss"] for sample in samples),

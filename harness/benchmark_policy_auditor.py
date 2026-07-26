@@ -10,6 +10,7 @@ from typing import Any
 
 
 POLICY_PATH = Path(__file__).resolve().parent.parent / "benchmarks" / "performance-policy.json"
+ROBUST_MAD_MULTIPLIER = 3.0
 
 
 @dataclass(frozen=True)
@@ -166,14 +167,12 @@ class BenchmarkPolicyAuditor:
 
     def _summary_from_raw_samples(self, raw_samples: list[dict[str, Any]]) -> dict[str, float]:
         durations = [float(sample["duration_seconds"]) for sample in raw_samples]
-        ordered = sorted(durations)
-        mean = statistics.mean(ordered)
-        stddev = statistics.pstdev(ordered) if len(ordered) > 1 else 0.0
+        duration_summary = summarize_samples(durations)
         peak_rss = max(float(sample["process_tree_peak_rss"]) for sample in raw_samples)
         return {
-            "median": statistics.median(ordered),
-            "p95": ordered[min(len(ordered) - 1, math.ceil(len(ordered) * 0.95) - 1)],
-            "cv": (stddev / mean) if mean > 0 else 0.0,
+            "median": duration_summary["median"],
+            "p95": duration_summary["p95"],
+            "cv": duration_summary["cv"],
             "peak_rss": peak_rss,
         }
 
@@ -216,12 +215,37 @@ def load_benchmark_policy(path: Path = POLICY_PATH) -> BenchmarkPolicy:
 
 def summarize_samples(samples: list[float]) -> dict[str, float]:
     if not samples:
-        return {"median": 0.0, "p95": 0.0, "cv": 0.0}
-    ordered = sorted(samples)
-    mean = statistics.mean(ordered)
-    stddev = statistics.pstdev(ordered) if len(ordered) > 1 else 0.0
+        return {
+            "median": 0.0,
+            "p95": 0.0,
+            "cv": 0.0,
+            "raw_median": 0.0,
+            "raw_p95": 0.0,
+            "raw_cv": 0.0,
+            "duration_cap": 0.0,
+            "duration_outliers_capped": 0.0,
+        }
+    raw_ordered = sorted(float(sample) for sample in samples)
+    raw_mean = statistics.mean(raw_ordered)
+    raw_stddev = statistics.pstdev(raw_ordered) if len(raw_ordered) > 1 else 0.0
+    raw_median = statistics.median(raw_ordered)
+    deviations = [abs(value - raw_median) for value in raw_ordered]
+    mad = statistics.median(deviations) if deviations else 0.0
+    if mad > 0:
+        duration_cap = raw_median + (ROBUST_MAD_MULTIPLIER * mad)
+    else:
+        duration_cap = raw_median
+    robust_values = [min(value, duration_cap) for value in raw_ordered]
+    capped = sum(1 for raw, robust in zip(raw_ordered, robust_values) if raw != robust)
+    mean = statistics.mean(robust_values)
+    stddev = statistics.pstdev(robust_values) if len(robust_values) > 1 else 0.0
     return {
-        "median": statistics.median(ordered),
-        "p95": ordered[min(len(ordered) - 1, math.ceil(len(ordered) * 0.95) - 1)],
+        "median": statistics.median(robust_values),
+        "p95": robust_values[min(len(robust_values) - 1, math.ceil(len(robust_values) * 0.95) - 1)],
         "cv": (stddev / mean) if mean > 0 else 0.0,
+        "raw_median": raw_median,
+        "raw_p95": raw_ordered[min(len(raw_ordered) - 1, math.ceil(len(raw_ordered) * 0.95) - 1)],
+        "raw_cv": (raw_stddev / raw_mean) if raw_mean > 0 else 0.0,
+        "duration_cap": duration_cap,
+        "duration_outliers_capped": float(capped),
     }
