@@ -1,8 +1,8 @@
 import os
 from pathlib import Path
 
-from benchmarks.context_usage_compare import _build_tknc_corpus, _load_index, _question_set, _search, _write_fixture_corpus
-from cida.application.selective_alias_resolution import AliasDetector, SelectiveAliasResolver
+from benchmarks.context_usage_compare import _build_tknc_corpus, _question_set, _search, _write_fixture_corpus
+from cida.application.selective_alias_resolution import SelectiveAliasResolver
 from cida.infrastructure.filesystem import PhysicalFilesystem
 from cida.infrastructure.hashing import HashService
 from cida.infrastructure.json_codec import JsonCodec
@@ -16,12 +16,12 @@ def test_tknc_search_detects_aliases_without_expected_alias_input(tmp_path):
 
     question = _question_set()[-1]
     search = _search(tknc, question.question)
-    index, _ = _load_index(tknc)
-    text = "\n".join((tknc / rel).read_text(encoding="utf-8") for rel in search.files)
-    aliases = AliasDetector().detect(text, index)
-    resolved = SelectiveAliasResolver(PhysicalFilesystem(), JsonCodec(), HashService()).resolve(aliases, str(tknc / "tknd"))
+    resolver = SelectiveAliasResolver(PhysicalFilesystem(), JsonCodec(), HashService())
+    aliases = set(resolver.locate_aliases(set(search.alias_candidates), str(tknc / "tknd")))
+    resolved = resolver.resolve(aliases, str(tknc / "tknd"))
 
     assert search.files
+    assert search.search_mode == "INDEXED"
     assert aliases
     assert resolved.resolved
     assert len(resolved.chunks_loaded) <= len(aliases)

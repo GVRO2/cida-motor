@@ -285,11 +285,20 @@ jobs:
     - name: Chunk Naming Scale Contract
       run: python -m pytest tests/test_corpus_chunk_naming.py -q
 
-    - name: Alias Index Integrity
-      run: python -m pytest tests/test_alias_index_v2.py tests/test_alias_index_scale.py tests/test_real_alias_range_contract.py -q
+    - name: Alias Codec Contract
+      run: python -m pytest tests/test_alias_codec.py -q
+
+    - name: Exact Alias Membership
+      run: python -m pytest tests/test_alias_index_v2.py tests/test_alias_index_scale.py tests/test_real_alias_range_contract.py tests/test_alias_false_positive_identifiers.py -q
 
     - name: Selective Lookup Instrumentation
-      run: python -m pytest tests/test_selective_alias_resolution.py tests/test_tknc_context_contract.py tests/test_no_sidecar_search_preload.py tests/test_tknc_context_session.py -q
+      run: python -m pytest tests/test_selective_alias_resolution.py tests/test_tknc_context_contract.py tests/test_no_sidecar_search_preload.py tests/test_tknc_context_session.py tests/test_context_session_close.py -q
+
+    - name: Byte-Bounded Cache
+      run: python -m pytest tests/test_byte_bounded_cache.py -q
+
+    - name: Content Search Index
+      run: python -m pytest tests/test_content_search_index.py tests/test_content_search_index_security.py -q
 
     - name: Real Search Benchmark
       run: python -m pytest tests/test_context_search_original.py tests/test_context_search_tknc.py -q
@@ -310,24 +319,30 @@ jobs:
       run: python -m pytest tests/test_context_usage_benchmark.py::test_multi_query_break_even_contract -q
 
     - name: Required Chunk Lookup
-      run: python -m pytest tests/test_context_usage_benchmark.py::test_lookup_reads_only_required_chunks tests/test_context_token_accounting.py tests/test_context_gate_independence.py tests/test_manifest_binding.py tests/test_tknc_multichunk_production.py tests/test_harness_report_events.py -q
+      run: python -m pytest tests/test_context_usage_benchmark.py::test_lookup_reads_only_required_chunks tests/test_context_token_accounting.py tests/test_context_gate_independence.py tests/test_manifest_binding.py tests/test_tknc_multichunk_production.py tests/test_harness_report_events.py tests/test_source_manifest_v2.py tests/test_bundle_manifest_v2.py tests/test_context_metric_semantics.py -q
 
     - name: Runtime Harness Isolation
       run: python -m pytest tests/test_runtime_harness_decoupling.py -q
 
+    - name: Runtime Harness Recursive Audit
+      run: python scripts/check_runtime_harness_references.py
+
     - name: Generate Context Artifacts
-      run: python benchmarks/context_usage_compare.py --output-json context-usage-report-v3-${{ matrix.os }}.json --output-markdown context-usage-report-v3-${{ matrix.os }}.md --read-events-json read-events-${{ matrix.os }}.json --harness-events-json harness-events-${{ matrix.os }}.json
+      run: python benchmarks/context_usage_compare.py --output-json context-usage-report-v4-${{ matrix.os }}.json --output-markdown context-usage-report-v4-${{ matrix.os }}.md --read-events-json context-read-events-v4-${{ matrix.os }}.json --cache-events-json context-cache-events-v4-${{ matrix.os }}.json --harness-events-json context-harness-events-v4-${{ matrix.os }}.json --source-manifest-json source-manifest-v2-${{ matrix.os }}.json --bundle-manifest-json bundle-manifest-v2-${{ matrix.os }}.json
 
     - name: Artifact Upload
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: context-usage-report-v3-${{ matrix.os }}
+        name: context-usage-report-v4-${{ matrix.os }}
         path: |
-          context-usage-report-v3-${{ matrix.os }}.json
-          context-usage-report-v3-${{ matrix.os }}.md
-          read-events-${{ matrix.os }}.json
-          harness-events-${{ matrix.os }}.json
+          context-usage-report-v4-${{ matrix.os }}.json
+          context-usage-report-v4-${{ matrix.os }}.md
+          context-read-events-v4-${{ matrix.os }}.json
+          context-cache-events-v4-${{ matrix.os }}.json
+          context-harness-events-v4-${{ matrix.os }}.json
+          source-manifest-v2-${{ matrix.os }}.json
+          bundle-manifest-v2-${{ matrix.os }}.json
 
   compare:
     name: Compare Manifests

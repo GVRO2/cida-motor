@@ -5,6 +5,7 @@ from cida.application.selective_alias_resolution import ALIAS_INDEX_FILENAME, Se
 from cida.infrastructure.filesystem import PhysicalFilesystem
 from cida.infrastructure.hashing import HashService
 from cida.infrastructure.json_codec import JsonCodec
+from cida.markdown.dictionary import generate_alias_candidates
 
 
 class _TokenCounter:
@@ -13,7 +14,8 @@ class _TokenCounter:
 
 
 def _corpus_dict(alias_count: int) -> dict[str, str]:
-    return {f"word_{i:06d}": f"A{i:06d}" for i in range(alias_count)}
+    aliases = generate_alias_candidates(set(), limit=alias_count)
+    return {f"word_{i:06d}": alias for i, alias in enumerate(aliases)}
 
 
 def test_corpus_chunk_filename_contract_for_required_scales():
@@ -48,6 +50,7 @@ def test_writer_generates_unique_chunks_and_roundtrip_beyond_three_thousand_alia
     assert index["chunks"][corpus_chunk_filename(6)]["entry_count"] == 1
 
     resolver = SelectiveAliasResolver(fs, jc, hs)
-    result = resolver.resolve({"A003000"}, str(tknd))
-    assert result.resolved == {"A003000": "word_003000"}
+    target_alias = generate_alias_candidates(set(), limit=3_001)[3_000]
+    result = resolver.resolve({target_alias}, str(tknd))
+    assert result.resolved == {target_alias: "word_003000"}
     assert result.chunks_loaded == (corpus_chunk_filename(6),)

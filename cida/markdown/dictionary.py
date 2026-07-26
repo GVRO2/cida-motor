@@ -1,6 +1,7 @@
 import re
-import string
 from collections import Counter
+
+from cida.domain.alias_codec import DEFAULT_ALIAS_CODEC
 
 _PROTECTED_HINT_RE = re.compile(
     r"`|^([ \t]{0,3})~{3,}|^---[ \t]*(?:\r?\n|$)|\]\(|https?://|\{|\$\{|<|"
@@ -19,39 +20,15 @@ def _needs_protection(text):
 
 def generate_alias_candidates(exclude_set, limit=5000):
     """
-    Generates a list of sorted, deterministic alias candidates (letters only)
-    excluding any strings present in exclude_set.
+    Generates sorted deterministic alias candidates through the canonical codec.
     """
+    if limit < 0:
+        raise ValueError(f"limit must be non-negative: {limit}")
     candidates = []
-
-    # 2-letter uppercase combinations (AA - ZZ)
-    for c1 in string.ascii_uppercase:
-        for c2 in string.ascii_uppercase:
-            cand = c1 + c2
-            if cand not in exclude_set:
-                candidates.append(cand)
-                if len(candidates) >= limit:
-                    return candidates
-
-    # 2-letter lowercase combinations (aa - zz)
-    for c1 in string.ascii_lowercase:
-        for c2 in string.ascii_lowercase:
-            cand = c1 + c2
-            if cand not in exclude_set:
-                candidates.append(cand)
-                if len(candidates) >= limit:
-                    return candidates
-
-    # 3-letter uppercase combinations (AAA - ZZZ)
-    for c1 in string.ascii_uppercase:
-        for c2 in string.ascii_uppercase:
-            for c3 in string.ascii_uppercase:
-                cand = c1 + c2 + c3
-                if cand not in exclude_set:
-                    candidates.append(cand)
-                    if len(candidates) >= limit:
-                        return candidates
-
+    for cand in DEFAULT_ALIAS_CODEC.iter_candidates(exclude_set):
+        candidates.append(cand)
+        if len(candidates) >= limit:
+            return candidates
     return candidates
 
 def find_candidate_words(text):

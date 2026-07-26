@@ -13,4 +13,7 @@ def test_production_cli_generates_real_multichunk_corpora(tmp_path):
 
         assert index["alias_count"] >= alias_target
         assert index["chunk_count"] >= expected_chunks
-        assert len(index["ranges"]) == index["chunk_count"]
+        assert index["schema_version"] == 3
+        assert index["membership"] == "EXACT_MEMBERSHIP"
+        assert index["segment_count"] == len(index["segments"])
+        assert "ranges" not in index

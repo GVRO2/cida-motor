@@ -217,6 +217,66 @@ def _requires_identity_semantic_validation(content: str) -> bool:
     return content.startswith("---")
 
 
+def _write_content_search_index(
+    dst_abs: str,
+    generated_bundles: list[tuple[str, str, str | None, bytes, bytes]],
+    file_repo: PhysicalFilesystem,
+    json_codec: JsonCodec,
+    hash_service: HashService,
+    corpus_hash: str,
+) -> None:
+    if not generated_bundles:
+        return
+    from cida.application.content_search_index import SEARCH_INDEX_FILENAME, build_content_search_index_artifacts
+
+    indexed_files: list[tuple[str, str]] = []
+    output_hashes: dict[str, str] = {}
+    for _, dest_path, _, _, out_bytes in generated_bundles:
+        rel_path = file_repo.relpath(dest_path, dst_abs).replace("\\", "/")
+        try:
+            text = out_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        indexed_files.append((rel_path, text))
+        output_hashes[rel_path] = hash_service.sha256(out_bytes)
+    if not indexed_files:
+        return
+    corpus_id = corpus_hash or hash_service.sha256(json_codec.canonical_encode(output_hashes).encode("utf-8"))
+    artifacts = build_content_search_index_artifacts(
+        indexed_files,
+        corpus_id=corpus_id,
+        hash_service=hash_service,
+        json_codec=json_codec,
+    )
+    tknd_dir = file_repo.join(dst_abs, "tknd")
+    file_repo.makedirs(tknd_dir)
+    for segment_path, segment_data in sorted(artifacts.segments.items()):
+        full_segment_path = file_repo.join(tknd_dir, *segment_path.split("/"))
+        file_repo.write_text(full_segment_path, json_codec.encode(segment_data, indent=4))
+    file_repo.write_text(file_repo.join(tknd_dir, SEARCH_INDEX_FILENAME), json_codec.encode(artifacts.root, indent=4))
+
+
+def _write_bundle_manifest(
+    dst_abs: str,
+    file_repo: PhysicalFilesystem,
+    json_codec: JsonCodec,
+    hash_service: HashService,
+    source_manifest_sha256: str,
+) -> None:
+    from cida.application.bundle_manifest import BUNDLE_MANIFEST_FILENAME, build_bundle_manifest
+
+    manifest = build_bundle_manifest(
+        dst_abs=dst_abs,
+        file_repo=file_repo,
+        hash_service=hash_service,
+        json_codec=json_codec,
+        source_manifest_sha256=source_manifest_sha256,
+    )
+    tknd_dir = file_repo.join(dst_abs, "tknd")
+    file_repo.makedirs(tknd_dir)
+    file_repo.write_text(file_repo.join(tknd_dir, BUNDLE_MANIFEST_FILENAME), json_codec.encode(manifest, indent=4))
+
+
 def counter_main():
     try:
         token_counter = OfflineTokenizer()
@@ -845,6 +905,11 @@ def main():
                 semantic_status=semantic_status,
                 execution_time=exec_time
             )
+
+        if not args.dry_run:
+            _write_content_search_index(dst_abs, generated_bundles, file_repo, json_codec, hash_service, corpus_hash)
+            source_manifest_sha256 = corpus_hash or hash_service.sha256(b"no-source-manifest")
+            _write_bundle_manifest(dst_abs, file_repo, json_codec, hash_service, source_manifest_sha256)
 
         report_name = args.report_path
         if not args.dry_run and args.report in ["text", "both", "json"]:

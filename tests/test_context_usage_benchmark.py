@@ -32,15 +32,17 @@ def test_full_vs_full_contract(tmp_path):
     assert result.returncode == 0, result.stderr + result.stdout
     report = json.loads(output_json.read_text(encoding="utf-8"))
 
-    assert report["schema_version"] == 3
+    assert report["schema_version"] == 4
     assert report["summary"]["overall_result"] == "PASS"
     assert report["summary"]["full_vs_full"]["result"] == "PASS"
     assert report["summary"]["selective_warm"]["result"] == "PASS"
     assert report["summary"]["multi_query"]["result"] == "PASS"
     assert report["summary"]["lookup"]["result"] == "PASS"
+    assert report["summary"]["search"]["result"] == "PASS"
+    assert report["cache"]["result"] == "PASS"
     assert report["summary"]["accuracy"]["tknc_score"] >= report["summary"]["accuracy"]["original_score"]
     assert len(report["scenarios"]) == 24
-    assert output_md.read_text(encoding="utf-8").startswith("# CIDA .tknc Context Usage Report v3")
+    assert output_md.read_text(encoding="utf-8").startswith("# CIDA .tknc Context Usage Report v4")
 
 
 def test_lookup_reads_only_required_chunks(tmp_path):

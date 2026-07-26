@@ -310,13 +310,13 @@ class TestPythonUsecases(unittest.TestCase):
 
         args = [
             "translate.py",
-            "A0",
+            "AA",
             "--path", tknd_path
         ]
         with patch.object(sys, "argv", args):
             with patch("builtins.print") as mock_print:
                 translate_main()
-                mock_print.assert_called_once_with({"A0": "Não encontrado"})
+                mock_print.assert_called_once_with({"AA": "Não encontrado"})
 
 
 if __name__ == "__main__":

@@ -4,12 +4,12 @@ import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
-from cida.application.selective_alias_resolution import build_alias_index, SelectiveAliasResolver, corpus_chunk_filename
+from cida.application.selective_alias_resolution import build_alias_index_artifacts, SelectiveAliasResolver, corpus_chunk_filename
 from cida.infrastructure.filesystem import PhysicalFilesystem
 from cida.infrastructure.hashing import HashService
 from cida.infrastructure.json_codec import JsonCodec
 from cida.interfaces.cli import main
-from tests.runtime_harness_probe import RuntimeHarnessProbe
+from devtools.runtime_harness_probe import RuntimeHarnessProbe
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -138,7 +138,7 @@ def test_tknc_alias_lookup_has_zero_harness_activity_under_probe(tmp_path):
     }
     serialized = jc.encode(sidecar_data, indent=4)
     (tknd / chunk_name).write_text(serialized, encoding="utf-8", newline="\n")
-    index_data = build_alias_index(
+    artifacts = build_alias_index_artifacts(
         {"AA": chunk_name},
         dictionary_id,
         {chunk_name: hs.sha256(serialized.encode("utf-8"))},
@@ -146,8 +146,13 @@ def test_tknc_alias_lookup_has_zero_harness_activity_under_probe(tmp_path):
         jc,
         manifest_sha256=manifest_sha256,
         chunk_entry_counts={chunk_name: 1},
+        chunk_entries_sha256={chunk_name: sidecar_data["entries_sha256"]},
     )
-    (tknd / "alias-index.json").write_text(jc.encode(index_data, indent=4), encoding="utf-8", newline="\n")
+    for segment_path, segment_data in artifacts.segments.items():
+        full_segment = tknd / segment_path
+        full_segment.parent.mkdir(parents=True, exist_ok=True)
+        full_segment.write_text(jc.encode(segment_data, indent=4), encoding="utf-8", newline="\n")
+    (tknd / "alias-index.json").write_text(jc.encode(artifacts.root, indent=4), encoding="utf-8", newline="\n")
 
     resolver = SelectiveAliasResolver(fs, jc, hs)
     with RuntimeHarnessProbe() as probe:

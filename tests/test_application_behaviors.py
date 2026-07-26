@@ -113,7 +113,7 @@ def test_optimize_corpus_skip_binary_check_applies_to_manifest_hashes():
     hs = HashService()
     jc = JsonCodec()
     builder = MagicMock()
-    builder.build_corpus_dictionary.return_value = {"regular_word_long": "A0"}
+    builder.build_corpus_dictionary.return_value = {"regular_word_long": "AA"}
 
     mock_fs = MagicMock()
     mock_fs.is_binary_file.side_effect = AssertionError("binary check should be skipped")
@@ -129,7 +129,7 @@ def test_optimize_corpus_skip_binary_check_applies_to_manifest_hashes():
         skip_binary_check=True,
     )
 
-    assert corpus_dict == {"regular_word_long": "A0"}
+    assert corpus_dict == {"regular_word_long": "AA"}
     assert corpus_hash
     assert sidecar_tokens > 0
     assert auxiliary_tokens > 0
